@@ -106,8 +106,9 @@ bool cPluginGstOutput::Start(void)
   }
   cOsdProvider::Shutdown();
   new cGstOsdProvider(device);
+  const char *connStr = *connector;
   isyslog("gstoutput: plugin started (video=%s audio=%s connector=%s)",
-          *videoSink, *audioSink, connector ? *connector : "auto");
+          *videoSink, *audioSink, (connStr && *connStr) ? connStr : "auto");
   return true;
 }
 

@@ -71,9 +71,10 @@ bool cGstDevice::BuildVideoPipeline(void)
     return false;
   }
 
-  if (connectorName && *connectorName && !strcmp(*videoSinkName, "kmssink"))
+  const char *connStr = *connectorName;
+  if (connStr && *connStr && !strcmp(*videoSinkName, "kmssink"))
     g_object_set(videosink, "connector-properties",
-                 gst_structure_new("props", "connector-name", G_TYPE_STRING, *connectorName, nullptr),
+                 gst_structure_new("props", "connector-name", G_TYPE_STRING, connStr, nullptr),
                  nullptr);
 
   g_object_set(videosink, "sync", TRUE, nullptr);
