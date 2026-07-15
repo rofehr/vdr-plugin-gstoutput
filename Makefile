@@ -17,17 +17,13 @@ VERSION = $(shell grep 'VERSION *=' gstoutput.c | awk '{ print $$4 }' | sed -e '
 CXX      ?= g++
 CXXFLAGS ?= -g -O2 -Wall -Wextra -Wno-parentheses -Wno-unused-parameter -fPIC
 
-### The directory environment (adjust VDRDIR to your Yocto/MLD sysroot's
-### VDR source tree, or override on the make command line):
-VDRDIR = ../../..
-LIBDIR = ../../lib
-TMPDIR = /tmp
+PKGCFG = $(if $(VDRDIR),$(shell pkg-config --variable=$(1) $(VDRDIR)/vdr.pc),$(shell pkg-config --variable=$(1) vdr || pkg-config --variable=$(1) ../../../vdr.pc))
+LIBDIR = $(call PKGCFG,libdir)
 
-### Allow user defined options to overwrite defaults:
--include $(VDRDIR)/Make.config
+-include $(VDRDIR)/Make.global
 
 ### The version number of VDR's plugin API:
-APIVERSION = $(shell sed -ne '/define APIVERSION/s/^.*"\(.*\)".*$$/\1/p' $(VDRDIR)/config.h 2>/dev/null)
+APIVERSION = $(call PKGCFG,apiversion)
 
 ### GStreamer flags via pkg-config (provided by the gstreamer1.0-*-dev /
 ### Yocto libgstreamer1.0 + libgstapp1.0 recipes):
