@@ -63,7 +63,7 @@ $(DEPFILE): Makefile
 ### Targets:
 libvdr-$(PLUGIN).so: $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared $(OBJS) $(GSTLIBS) -o $@
-	@cp --remove-destination $@ $(LIBDIR)/$@.$(APIVERSION)
+
 
 install-lib: libvdr-$(PLUGIN).so
 	install -d $(DESTDIR)$(LIBDIR)
