@@ -14,7 +14,7 @@ cGstDevice::~cGstDevice()
 
 bool cGstDevice::Init(void)
 {
-  //cMutexLock lock(&mutex);
+  cMutexLock lock(&mutex);
   if (initialized)
     return true;
 
@@ -64,12 +64,26 @@ bool cGstDevice::BuildVideoPipeline(void)
   compositor            = gst_element_factory_make("compositor", "video-mixer");
   GstElement *videosink = gst_element_factory_make(*videoSinkName, "video-sink");
 
-  if (!video.appsrc || !parse || !decode || !convert || !compositor || !videosink) {
-    esyslog("gstoutput: missing GStreamer element(s) for video pipeline "
-            "(check that gstreamer1.0-plugins-{base,good,bad} and %s are installed)",
-            *videoSinkName);
-    return false;
+  struct { const char *name; GstElement *elem; } required[] = {
+    { "appsrc",           video.appsrc },
+    { "h264parse",        parse },
+    { "decodebin",        decode },
+    { "videoconvert",     convert },
+    { "compositor",       compositor },
+    { *videoSinkName,     videosink },
+  };
+  bool missing = false;
+  for (auto &r : required) {
+    if (!r.elem) {
+      esyslog("gstoutput: GStreamer element factory '%s' not found — "
+              "run 'gst-inspect-1.0 %s' on the target to confirm, then check "
+              "which gstreamer1.0-plugins-{base,good,bad} package provides it "
+              "and whether it's in your image/recipe DEPENDS+RDEPENDS", r.name, r.name);
+      missing = true;
+    }
   }
+  if (missing)
+    return false;
 
   const char *connStr = *connectorName;
   if (connStr && *connStr && !strcmp(*videoSinkName, "kmssink"))
@@ -145,6 +159,7 @@ bool cGstDevice::BuildAudioPipeline(void)
                "format", GST_FORMAT_TIME,
                "do-timestamp", FALSE,
                "block", TRUE,
+               "max-bytes", (guint64)(256 * 1024), // throttle VDR feed to sink's real drain rate
                nullptr);
 
   GstElement *parse    = gst_element_factory_make("aacparse", "audio-parse"); // swap for ac3parse/mpegaudioparse as needed
@@ -153,10 +168,34 @@ bool cGstDevice::BuildAudioPipeline(void)
   GstElement *resample = gst_element_factory_make("audioresample", "audio-resample");
   GstElement *sink     = gst_element_factory_make(*audioSinkName, "audio-sink");
 
-  if (!audio.appsrc || !parse || !decode || !convert || !resample || !sink) {
-    esyslog("gstoutput: missing GStreamer element(s) for audio pipeline (sink=%s)", *audioSinkName);
-    return false;
+  if (sink && !strcmp(*audioSinkName, "alsasink")) {
+    // Larger ALSA period/buffer to absorb bursty delivery from VDR while
+    // PTS-based pacing (see PlayAudio() TODO) isn't wired up yet. Values
+    // are in microseconds.
+    g_object_set(sink,
+                 "buffer-time", (gint64)200000,
+                 "latency-time", (gint64)20000,
+                 nullptr);
   }
+
+  struct { const char *name; GstElement *elem; } required[] = {
+    { "appsrc",         audio.appsrc },
+    { "aacparse",       parse },
+    { "decodebin",      decode },
+    { "audioconvert",   convert },
+    { "audioresample",  resample },
+    { *audioSinkName,   sink },
+  };
+  bool missing = false;
+  for (auto &r : required) {
+    if (!r.elem) {
+      esyslog("gstoutput: GStreamer element factory '%s' not found — "
+              "run 'gst-inspect-1.0 %s' on the target to confirm", r.name, r.name);
+      missing = true;
+    }
+  }
+  if (missing)
+    return false;
 
   gst_bin_add_many(GST_BIN(audio.pipeline), audio.appsrc, parse, decode, convert, resample, sink, nullptr);
 
@@ -172,6 +211,7 @@ bool cGstDevice::BuildAudioPipeline(void)
   }), convert);
 
   gst_element_link_many(convert, resample, sink, nullptr);
+  audio.sink = sink;
 
   audio.bus = gst_pipeline_get_bus(GST_PIPELINE(audio.pipeline));
   audio.watchId = gst_bus_add_watch(audio.bus, BusCallback, this);
@@ -204,7 +244,7 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
 
 void cGstDevice::Shutdown(void)
 {
-  //cMutexLock lock(&mutex);
+  cMutexLock lock(&mutex);
   if (!initialized)
     return;
 
@@ -228,7 +268,7 @@ void cGstDevice::Shutdown(void)
 
 bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
 {
-  //cMutexLock lock(&mutex);
+  cMutexLock lock(&mutex);
   switch (PlayMode) {
     case pmNone:
       gst_element_set_state(video.pipeline, GST_STATE_READY);
@@ -263,7 +303,7 @@ void cGstDevice::TrickSpeed(int Speed, bool Forward)
 
 void cGstDevice::Clear(void)
 {
-  //cMutexLock lock(&mutex);
+  cMutexLock lock(&mutex);
   if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_start());
   if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_stop(TRUE));
   if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_start());
@@ -303,9 +343,7 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
   if (!video.appsrc || Length <= 0)
     return Length;
-  
-  esyslog("gstoutput: PlayVideo Length %d", Length);
- 
+
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
 
@@ -326,8 +364,6 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 {
   if (!audio.appsrc || Length <= 0)
     return Length;
-
-  esyslog("gstoutput: PlayAudio Length %d", Length);
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
