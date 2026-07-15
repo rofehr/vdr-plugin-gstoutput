@@ -18,6 +18,14 @@ struct cGstStream {
   bool        eos        = false;
 };
 
+// Tracks 33-bit (90kHz) PES PTS unwrap state for one elementary stream, so
+// that wraparounds (every ~26.5h) and normal 90kHz counting turn into a
+// monotonically increasing 64-bit value.
+struct cPtsUnwrap {
+  int64_t last     = -1; // last raw 33-bit PTS seen
+  int64_t extended = -1; // unwrapped, ever-increasing 90kHz counter
+};
+
 class cGstDevice : public cDevice {
 private:
   cString videoSinkName;
@@ -35,6 +43,17 @@ private:
   bool initialized = false;
 
   double currentPts = 0.0;
+
+  // --- PTS handling (see PlayVideo/PlayAudio) ---
+  GstClock *sharedClock  = nullptr; // one clock instance for both pipelines, so
+                                     // their running-time bases actually agree
+  cMutex    ptsMutex;
+  int64_t   ptsBaseline90k = -1;    // first PTS seen (video or audio) -> running time 0
+  cPtsUnwrap videoPtsState;
+  cPtsUnwrap audioPtsState;
+
+  GstClockTime UnwrapAndOffsetPts(cPtsUnwrap &State, int64_t RawPts33);
+  void         SyncPipelineClocks(void);
 
   bool BuildVideoPipeline(void);
   bool BuildAudioPipeline(void);

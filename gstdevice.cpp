@@ -2,6 +2,66 @@
 #include <vdr/tools.h>
 #include <string.h>
 
+namespace {
+
+// 33-bit PTS/DTS wrap boundary, per MPEG-2 Systems (ISO/IEC 13818-1).
+constexpr int64_t PTS_MASK = 0x1FFFFFFFFLL;
+constexpr int64_t PTS_HALF = PTS_MASK >> 1;
+
+// Stream IDs that never carry a standard PES optional header (padding,
+// program stream map/directory, private_stream_2, ECM/EMM, DSMCC, etc.).
+bool StreamIdHasNoPesHeader(uchar StreamId)
+{
+  switch (StreamId) {
+    case 0xBC: case 0xBE: case 0xBF: case 0xF0:
+    case 0xF1: case 0xF2: case 0xFF:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Extracts the 33-bit, 90kHz PTS from a PES packet as delivered by VDR to
+// cDevice::PlayVideo()/PlayAudio(). Returns false if Data isn't a
+// start-code-prefixed PES packet, or carries no PTS (PTS_DTS_flags == 0).
+//
+// PES header layout (relevant part), ISO/IEC 13818-1 2.4.3.7:
+//   [0..2]  packet_start_code_prefix = 00 00 01
+//   [3]     stream_id
+//   [4..5]  PES_packet_length
+//   [6]     '10' + scrambling + priority + alignment + copyright + original
+//   [7]     PTS_DTS_flags(2) + ESCR_flag + ES_rate_flag + ... (1 byte)
+//   [8]     PES_header_data_length
+//   [9..13] PTS (5 bytes, present iff PTS_DTS_flags != 0)
+bool ExtractPesPts(const uchar *Data, int Length, int64_t &Pts90k)
+{
+  if (Length < 14)
+    return false;
+  if (Data[0] != 0x00 || Data[1] != 0x00 || Data[2] != 0x01)
+    return false; // not PES-framed (e.g. a bare ES fragment) - caller falls back to no-PTS
+  if (StreamIdHasNoPesHeader(Data[3]))
+    return false;
+  if ((Data[6] & 0xC0) != 0x80)
+    return false; // not an MPEG-2 optional PES header
+  uchar ptsDtsFlags = (Data[7] >> 6) & 0x03;
+  if (ptsDtsFlags == 0)
+    return false; // no PTS in this packet
+  const uchar *p = Data + 9;
+  if ((p[0] & 0xF0) != 0x20 && (p[0] & 0xF0) != 0x30)
+    return false; // marker nibble mismatch, malformed/unexpected header
+
+  int64_t b32_30 = (p[0] >> 1) & 0x07;
+  int64_t b29_22 = p[1];
+  int64_t b21_15 = (p[2] >> 1) & 0x7F;
+  int64_t b14_7  = p[3];
+  int64_t b6_0   = (p[4] >> 1) & 0x7F;
+
+  Pts90k = (b32_30 << 30) | (b29_22 << 22) | (b21_15 << 15) | (b14_7 << 7) | b6_0;
+  return true;
+}
+
+} // namespace
+
 cGstDevice::cGstDevice(const char *VideoSink, const char *AudioSink, const char *Connector)
 : videoSinkName(VideoSink), audioSinkName(AudioSink), connectorName(Connector)
 {
@@ -219,7 +279,58 @@ bool cGstDevice::BuildAudioPipeline(void)
   return true;
 }
 
-gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
+// Turns a raw 33-bit PES PTS into a monotonically increasing 90kHz value
+// relative to a shared baseline (the first PTS observed on *either* the
+// video or audio stream). Handles the ~26.5h wraparound of the 33-bit
+// counter. Both streams must go through the same ptsBaseline90k so that
+// their resulting running times line up for A/V sync.
+GstClockTime cGstDevice::UnwrapAndOffsetPts(cPtsUnwrap &State, int64_t RawPts33)
+{
+  cMutexLock lock(&ptsMutex);
+
+  if (State.last < 0) {
+    State.extended = RawPts33;
+  } else {
+    int64_t diff = RawPts33 - State.last;
+    if (diff < -PTS_HALF)
+      diff += (PTS_MASK + 1); // forward wrap
+    else if (diff > PTS_HALF)
+      diff -= (PTS_MASK + 1); // backward discontinuity (e.g. channel switch)
+    State.extended += diff;
+  }
+  State.last = RawPts33;
+
+  if (ptsBaseline90k < 0)
+    ptsBaseline90k = State.extended;
+
+  int64_t rel90k = State.extended - ptsBaseline90k;
+  if (rel90k < 0)
+    rel90k = 0; // the other stream's PTS arrived first and set an earlier baseline
+
+  return gst_util_uint64_scale(static_cast<guint64>(rel90k), GST_SECOND, 90000);
+}
+
+// Gives both pipelines the same GstClock instance and the same base_time,
+// which is required for two independent pipelines to agree on "running
+// time" and therefore stay in sync. Without this, each pipeline picks its
+// own base_time on the PAUSED->PLAYING transition and audio/video will
+// drift by whatever startup jitter existed between the two transitions.
+void cGstDevice::SyncPipelineClocks(void)
+{
+  if (!sharedClock)
+    sharedClock = gst_system_clock_obtain();
+
+  gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
+  gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
+
+  GstClockTime now = gst_clock_get_time(sharedClock);
+  gst_element_set_base_time(video.pipeline, now);
+  gst_element_set_base_time(audio.pipeline, now);
+  gst_element_set_start_time(video.pipeline, GST_CLOCK_TIME_NONE); // don't let auto-flush-start rebase us
+  gst_element_set_start_time(audio.pipeline, GST_CLOCK_TIME_NONE);
+}
+
+
 {
   cGstDevice *self = static_cast<cGstDevice *>(data);
   switch (GST_MESSAGE_TYPE(msg)) {
@@ -264,6 +375,11 @@ void cGstDevice::Shutdown(void)
   }
   initialized = false;
   playing = false;
+
+  if (sharedClock) {
+    gst_object_unref(sharedClock);
+    sharedClock = nullptr;
+  }
 }
 
 bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
@@ -278,6 +394,7 @@ bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
     case pmAudioVideo:
     case pmVideoOnly:
     case pmAudioOnly:
+      SyncPipelineClocks();
       gst_element_set_state(video.pipeline, GST_STATE_PLAYING);
       gst_element_set_state(audio.pipeline, GST_STATE_PLAYING);
       playing = true;
@@ -308,6 +425,14 @@ void cGstDevice::Clear(void)
   if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_stop(TRUE));
   if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_start());
   if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_stop(TRUE));
+
+  {
+    cMutexLock ptsLock(&ptsMutex);
+    ptsBaseline90k = -1;
+    videoPtsState = cPtsUnwrap();
+    audioPtsState = cPtsUnwrap();
+  }
+
   cDevice::Clear();
 }
 
@@ -347,10 +472,11 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
 
-  // NOTE: VDR delivers PES/TS packets with PTS embedded in the packet
-  // header; extract it here (omitted for brevity) and set:
-  // GST_BUFFER_PTS(buf) = pts_in_ns;
-  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
+  int64_t rawPts90k;
+  if (ExtractPesPts(Data, Length, rawPts90k))
+    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
+  else
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(video.appsrc), buf);
   if (ret != GST_FLOW_OK) {
@@ -367,7 +493,12 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
-  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // see PlayVideo note
+
+  int64_t rawPts90k;
+  if (ExtractPesPts(Data, Length, rawPts90k))
+    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
+  else
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(audio.appsrc), buf);
   if (ret != GST_FLOW_OK) {
@@ -381,8 +512,17 @@ int64_t cGstDevice::GetSTC(void)
 {
   if (!video.pipeline)
     return -1;
-  gint64 pos = 0;
-  if (gst_element_query_position(video.pipeline, GST_FORMAT_TIME, &pos))
-    return pos / 100; // convert ns -> 90kHz-ish scale used by VDR STC callers
-  return -1;
+  gint64 posNs = 0;
+  if (!gst_element_query_position(video.pipeline, GST_FORMAT_TIME, &posNs))
+    return -1;
+
+  int64_t pos90k = static_cast<int64_t>(gst_util_uint64_scale(static_cast<guint64>(posNs), 90000, GST_SECOND));
+
+  cMutexLock lock(&ptsMutex);
+  if (ptsBaseline90k < 0)
+    return pos90k; // no PES PTS observed yet, best effort
+
+  // Re-express in the original broadcast PTS domain (mod 2^33), since
+  // that's what callers comparing against raw stream PTS values expect.
+  return (pos90k + ptsBaseline90k) & PTS_MASK;
 }
