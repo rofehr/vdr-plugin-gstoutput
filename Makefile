@@ -62,7 +62,7 @@ $(DEPFILE): Makefile
 
 ### Targets:
 libvdr-$(PLUGIN).so: $(OBJS)
-	$(CXX) $(CXXFLAGS) -shared $(OBJS) $(GSTLIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -shared $(OBJS) $(GSTLIBS) -o $@
 
 
 install-lib: libvdr-$(PLUGIN).so
