@@ -14,7 +14,7 @@ cGstDevice::~cGstDevice()
 
 bool cGstDevice::Init(void)
 {
-  cMutexLock lock(&mutex);
+  //cMutexLock lock(&mutex);
   if (initialized)
     return true;
 
@@ -204,7 +204,7 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
 
 void cGstDevice::Shutdown(void)
 {
-  cMutexLock lock(&mutex);
+  //cMutexLock lock(&mutex);
   if (!initialized)
     return;
 
@@ -228,7 +228,7 @@ void cGstDevice::Shutdown(void)
 
 bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
 {
-  cMutexLock lock(&mutex);
+  //cMutexLock lock(&mutex);
   switch (PlayMode) {
     case pmNone:
       gst_element_set_state(video.pipeline, GST_STATE_READY);
@@ -263,7 +263,7 @@ void cGstDevice::TrickSpeed(int Speed, bool Forward)
 
 void cGstDevice::Clear(void)
 {
-  cMutexLock lock(&mutex);
+  //cMutexLock lock(&mutex);
   if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_start());
   if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_stop(TRUE));
   if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_start());
