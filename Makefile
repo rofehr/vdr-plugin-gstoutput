@@ -65,8 +65,11 @@ libvdr-$(PLUGIN).so: $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared $(OBJS) $(GSTLIBS) -o $@
 	@cp --remove-destination $@ $(LIBDIR)/$@.$(APIVERSION)
 
-install: all
-	install -D libvdr-$(PLUGIN).so $(DESTDIR)/usr/lib/vdr/plugins/libvdr-$(PLUGIN).so.$(APIVERSION)
+install-lib: libvdr-$(PLUGIN).so
+	install -d $(DESTDIR)$(LIBDIR)
+	install -m755 libvdr-$(PLUGIN).so $(DESTDIR)$(LIBDIR)/libvdr-$(PLUGIN).so.$(APIVERSION)
+		
+install: install-lib
 
 dist: clean
 	@-rm -rf $(TMPDIR)/$(ARCHIVE)
