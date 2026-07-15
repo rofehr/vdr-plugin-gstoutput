@@ -327,6 +327,8 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
   if (!audio.appsrc || Length <= 0)
     return Length;
 
+  esyslog("gstoutput: PlayAudio Length %d", Length);
+
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
   GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // see PlayVideo note
