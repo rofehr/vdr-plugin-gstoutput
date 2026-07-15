@@ -303,7 +303,9 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
   if (!video.appsrc || Length <= 0)
     return Length;
-
+  
+  esyslog("gstoutput: PlayVideo Length %d", Length);
+ 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
   gst_buffer_fill(buf, 0, Data, Length);
 
