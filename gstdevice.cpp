@@ -331,6 +331,7 @@ void cGstDevice::SyncPipelineClocks(void)
 }
 
 
+gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
 {
   cGstDevice *self = static_cast<cGstDevice *>(data);
   switch (GST_MESSAGE_TYPE(msg)) {
