@@ -558,9 +558,9 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
   static long callCount = 0;
   if (callCount == 0)
-    isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
-            Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
-            Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
+    //isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
+    //        Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
+    //        Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
   //if (++callCount % 200 == 0)
   //  isyslog("gstoutput: PlayVideo() called %ld times so far", callCount);
 
@@ -587,8 +587,8 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 {
   static long callCount = 0;
-  if (callCount == 0)
-    isyslog("gstoutput: PlayAudio() called for the first time (Length=%d, Id=%d)", Length, Id);
+  //if (callCount == 0)
+  //  isyslog("gstoutput: PlayAudio() called for the first time (Length=%d, Id=%d)", Length, Id);
   //if (++callCount % 200 == 0)
   //  isyslog("gstoutput: PlayAudio() called %ld times so far", callCount);
 
@@ -626,8 +626,8 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
     return 0;
 
   static long tsCallCount = 0;
-  if (tsCallCount == 0)
-    isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
+ // if (tsCallCount == 0)
+ //   isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
   //if (++tsCallCount % 500 == 0)
   //  isyslog("gstoutput: PlayTs() called %ld times so far", tsCallCount);
 
