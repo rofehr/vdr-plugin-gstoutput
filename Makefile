@@ -40,7 +40,7 @@ INCLUDES += -I$(VDRDIR)/include $(GSTCFLAGS)
 DEFINES  += -D_GNU_SOURCE -DPLUGIN_NAME_I18N='"$(PLUGIN)"'
 
 ### The object files (add further files here):
-OBJS = gstoutput.o gstdevice.o gstosd.o
+OBJS = gstoutput.o gstdevice.o gstosd.o gstsetup.o
 
 ### The main target:
 all: libvdr-$(PLUGIN).so
@@ -56,7 +56,7 @@ all: libvdr-$(PLUGIN).so
 MAKEDEP = $(CXX) -MM -MG
 DEPFILE = .dependencies
 $(DEPFILE): Makefile
-	@$(MAKEDEP) $(DEFINES) $(INCLUDES) gstoutput.c gstdevice.cpp gstosd.cpp > $@
+	@$(MAKEDEP) $(DEFINES) $(INCLUDES) gstoutput.c gstdevice.cpp gstosd.cpp gstsetup.cpp > $@
 
 -include $(DEPFILE)
 

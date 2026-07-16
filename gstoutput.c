@@ -23,17 +23,18 @@
 
 #include "gstdevice.h"
 #include "gstosd.h"
+#include "gstconfig.h"
+#include "gstsetup.h"
 
 static const char *VERSION        = "0.1.0";
 static const char *DESCRIPTION    = "GStreamer based output device";
 static const char *MAINMENUENTRY  = NULL;
 
+cGstConfig GstConfig; // single shared instance, see gstconfig.h
+
 class cPluginGstOutput : public cPlugin {
 private:
   cGstDevice *device = nullptr;
-  cString videoSink  = "kmssink";
-  cString audioSink  = "alsasink";
-  cString connector  = "";   // optional DRM connector override, e.g. "HDMI-A-1"
 
 public:
   cPluginGstOutput() = default;
@@ -79,9 +80,9 @@ bool cPluginGstOutput::ProcessArgs(int argc, char *argv[])
   int c;
   while ((c = getopt_long(argc, argv, "v:a:c:", long_options, nullptr)) != -1) {
     switch (c) {
-      case 'v': videoSink = optarg; break;
-      case 'a': audioSink = optarg; break;
-      case 'c': connector = optarg; break;
+      case 'v': GstConfig.videoSink = optarg; break;
+      case 'a': GstConfig.audioSink = optarg; break;
+      case 'c': GstConfig.connector = optarg; break;
       default:  return false;
     }
   }
@@ -92,7 +93,7 @@ bool cPluginGstOutput::Initialize(void)
 {
   // gst_init() is deferred to Start() so ProcessArgs() / SetupParse()
   // options are already known (sink names, connector, etc.)
-  device = new cGstDevice(*videoSink, *audioSink, *connector);
+  device = new cGstDevice(*GstConfig.videoSink, *GstConfig.audioSink, *GstConfig.connector);
   return device != nullptr;
 }
 
@@ -106,9 +107,9 @@ bool cPluginGstOutput::Start(void)
   }
   cOsdProvider::Shutdown();
   new cGstOsdProvider(device);
-  const char *connStr = *connector;
+  const char *connStr = *GstConfig.connector;
   isyslog("gstoutput: plugin started (video=%s audio=%s connector=%s)",
-          *videoSink, *audioSink, (connStr && *connStr) ? connStr : "auto");
+          *GstConfig.videoSink, *GstConfig.audioSink, (connStr && *connStr) ? connStr : "auto");
   return true;
 }
 
@@ -128,16 +129,16 @@ cString cPluginGstOutput::Active(void)
 
 bool cPluginGstOutput::SetupParse(const char *Name, const char *Value)
 {
-  if (!strcasecmp(Name, "VideoSink"))      videoSink = Value;
-  else if (!strcasecmp(Name, "AudioSink")) audioSink = Value;
-  else if (!strcasecmp(Name, "Connector")) connector = Value;
+  if (!strcasecmp(Name, "VideoSink"))      GstConfig.videoSink = Value;
+  else if (!strcasecmp(Name, "AudioSink")) GstConfig.audioSink = Value;
+  else if (!strcasecmp(Name, "Connector")) GstConfig.connector = Value;
   else return false;
   return true;
 }
 
 cMenuSetupPage *cPluginGstOutput::SetupMenu(void)
 {
-  return nullptr; // see gstsetup.h/.cpp for the full setup page
+  return new cMenuSetupGst();
 }
 
 bool cPluginGstOutput::Service(const char *Id, void *Data)
