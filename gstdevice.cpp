@@ -583,10 +583,17 @@ void cGstDevice::TrickSpeed(int Speed, bool Forward)
 void cGstDevice::Clear(void)
 {
   cMutexLock lock(&mutex);
-  if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_start());
-  if (video.appsrc) gst_element_send_event(video.appsrc, gst_event_new_flush_stop(TRUE));
-  if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_start());
-  if (audio.appsrc) gst_element_send_event(audio.appsrc, gst_event_new_flush_stop(TRUE));
+
+  // NOTE: we deliberately do NOT send flush-start/flush-stop events
+  // directly to the running appsrc elements here anymore. Doing so
+  // triggered "Internal data stream error" from gst_base_src_loop() /
+  // gst_queue_handle_sink_event() (observed inside vaapidecodebin's
+  // internal queue) - appsrc manages its own flush state internally, and
+  // injecting raw flush events into a live streaming thread this way is
+  // not the supported way to reset it. Our own PTS baseline / TS-to-PES /
+  // PAT-PMT resets below are enough for a clean channel switch; stale
+  // buffered data downstream simply gets played out or overwritten by the
+  // new stream's own discontinuities.
 
   {
     cMutexLock ptsLock(&ptsMutex);
