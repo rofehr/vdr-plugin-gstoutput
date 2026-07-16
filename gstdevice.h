@@ -65,6 +65,7 @@ private:
 
   bool BuildVideoPipeline(void);
   bool BuildAudioPipeline(void);
+  void PushInitialOsdFrame(void);
   static gboolean BusCallback(GstBus *bus, GstMessage *msg, gpointer data);
 
 protected:
@@ -91,6 +92,14 @@ public:
   bool Init(void);
   void Shutdown(void);
   bool IsPlaying(void) const { return playing; }
+
+  // Let an independent playback session (e.g. the media player, see
+  // gstplayer.h) temporarily take over the display/audio hardware: our
+  // own video pipeline holds the DRM plane via kmssink as long as it's
+  // not in NULL state, which would conflict with a second sink trying to
+  // grab the same plane.
+  void SuspendDisplay(void);
+  void ResumeDisplay(void);
 
   // Used by cGstOsdProvider to push a rendered OSD frame into the mixer.
   GstElement *OsdAppSrc(void) { return osdAppsrc; }

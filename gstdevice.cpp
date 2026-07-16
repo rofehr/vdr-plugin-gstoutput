@@ -91,8 +91,30 @@ bool cGstDevice::Init(void)
   gst_element_set_state(video.pipeline, GST_STATE_READY);
   gst_element_set_state(audio.pipeline, GST_STATE_READY);
 
+  PushInitialOsdFrame();
+
   initialized = true;
   return true;
+}
+
+// compositor (like any GStreamer mixer element) requires every sink pad to
+// receive at least one buffer before the pipeline can complete preroll and
+// actually start rendering. Our OSD appsrc only pushes a buffer when VDR
+// calls cGstOsd::Flush() - i.e. when something is actually being shown on
+// the OSD. During plain live TV viewing with no menu/OSD open, that pad
+// would otherwise never preroll, and the *entire* pipeline (including the
+// video branch that has plenty of frames) stays stuck rendering nothing.
+void cGstDevice::PushInitialOsdFrame(void)
+{
+  if (!osdAppsrc)
+    return;
+  const int w = 1920, h = 1080; // matches the caps set on osdAppsrc
+  GstBuffer *buf = gst_buffer_new_allocate(nullptr, (gsize)w * h * 4, nullptr);
+  gst_buffer_memset(buf, 0, 0, gst_buffer_get_size(buf)); // fully transparent (alpha=0)
+  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
+  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(osdAppsrc), buf);
+  if (ret != GST_FLOW_OK)
+    esyslog("gstoutput: initial OSD preroll frame push failed (%d)", ret);
 }
 
 // -----------------------------------------------------------------------
