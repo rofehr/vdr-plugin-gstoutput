@@ -129,6 +129,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     { "h264parse",        parse },
     { "decodebin",        decode },
     { "videoconvert",     convert },
+    { "queue",            videoQueue },
     { "compositor",       compositor },
     { *videoSinkName,     videosink },
   };
@@ -153,8 +154,24 @@ bool cGstDevice::BuildVideoPipeline(void)
 
   g_object_set(videosink, "sync", TRUE, nullptr);
 
+  GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
+  if (videoQueue) {
+    // Same rationale as the audio queue: decouples the sink's real-time
+    // sync-blocking render loop into its own GStreamer streaming thread,
+    // so gst_app_src_push_buffer() (called synchronously from VDR's own
+    // receiver thread via PlayTs()/PlayVideo()) never blocks waiting for
+    // kmssink's display timing. Without this, VDR's own DVB receive ring
+    // buffer overflows because it can't be drained fast enough.
+    g_object_set(videoQueue,
+                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-bytes", (guint)0,
+                 "max-size-buffers", (guint)0,
+                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest frames on sustained overrun
+                 nullptr);
+  }
+
   gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decode, convert,
-                    compositor, videosink, nullptr);
+                    videoQueue, compositor, videosink, nullptr);
 
   if (!gst_element_link(video.appsrc, parse)) {
     esyslog("gstoutput: failed to link appsrc -> h264parse");
@@ -180,8 +197,12 @@ bool cGstDevice::BuildVideoPipeline(void)
     gst_object_unref(sinkpad);
   }), convert);
 
-  if (!gst_element_link(convert, compositor)) {
-    esyslog("gstoutput: failed to link videoconvert -> compositor");
+  if (!gst_element_link(convert, videoQueue)) {
+    esyslog("gstoutput: failed to link videoconvert -> queue");
+    return false;
+  }
+  if (!gst_element_link(videoQueue, compositor)) {
+    esyslog("gstoutput: failed to link queue -> compositor");
     return false;
   }
   if (!gst_element_link(compositor, videosink)) {
