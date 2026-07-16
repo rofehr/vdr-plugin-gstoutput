@@ -121,6 +121,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   GstElement *parse    = gst_element_factory_make("h264parse", "video-parse");
   GstElement *decode    = gst_element_factory_make("decodebin", "video-decode");
   GstElement *convert   = gst_element_factory_make("videoconvert", "video-convert");
+  GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
   compositor            = gst_element_factory_make("compositor", "video-mixer");
   GstElement *videosink = gst_element_factory_make(*videoSinkName, "video-sink");
 
@@ -154,7 +155,6 @@ bool cGstDevice::BuildVideoPipeline(void)
 
   g_object_set(videosink, "sync", TRUE, nullptr);
 
-  GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
   if (videoQueue) {
     // Same rationale as the audio queue: decouples the sink's real-time
     // sync-blocking render loop into its own GStreamer streaming thread,
