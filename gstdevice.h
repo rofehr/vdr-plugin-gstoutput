@@ -93,6 +93,12 @@ public:
   void Shutdown(void);
   bool IsPlaying(void) const { return playing; }
 
+  // gst_bus_add_watch() requires something to iterate the default
+  // GMainContext, which VDR never does - so bus callbacks registered that
+  // way simply never fire. We poll both buses manually instead, called
+  // from cPlugin::MainThreadHook() which VDR does call regularly.
+  void PollBus(void);
+
   // Let an independent playback session (e.g. the media player, see
   // gstplayer.h) temporarily take over the display/audio hardware: our
   // own video pipeline holds the DRM plane via kmssink as long as it's

@@ -48,7 +48,7 @@ public:
   virtual bool Start(void);
   virtual void Stop(void);
   virtual void Housekeeping(void) {}
-  virtual void MainThreadHook(void) {}
+  virtual void MainThreadHook(void) { if (device) device->PollBus(); }
   virtual cString Active(void);
   virtual time_t WakeupTime(void) { return 0; }
   virtual const char *MainMenuEntry(void) { return MAINMENUENTRY; }

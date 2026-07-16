@@ -297,7 +297,6 @@ bool cGstDevice::BuildVideoPipeline(void)
   g_object_set(compositor, "background", 1 /* GST_COMPOSITOR_BACKGROUND_BLACK */, nullptr);
 
   video.bus = gst_pipeline_get_bus(GST_PIPELINE(video.pipeline));
-  video.watchId = gst_bus_add_watch(video.bus, BusCallback, this);
 
 
   return true;
@@ -390,7 +389,6 @@ bool cGstDevice::BuildAudioPipeline(void)
   audio.sink = sink;
 
   audio.bus = gst_pipeline_get_bus(GST_PIPELINE(audio.pipeline));
-  audio.watchId = gst_bus_add_watch(audio.bus, BusCallback, this);
 
   return true;
 }
@@ -495,6 +493,29 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
   return TRUE;
 }
 
+// Called from cPlugin::MainThreadHook(). See the comment in gstdevice.h -
+// gst_bus_add_watch() needs a running GLib main loop to ever invoke its
+// callback, which VDR doesn't provide, so we drain both buses manually
+// instead. gst_bus_pop() is non-blocking (returns nullptr immediately if
+// there's nothing pending), so this is safe to call frequently.
+void cGstDevice::PollBus(void)
+{
+  if (video.bus) {
+    GstMessage *msg;
+    while ((msg = gst_bus_pop(video.bus)) != nullptr) {
+      BusCallback(video.bus, msg, this);
+      gst_message_unref(msg);
+    }
+  }
+  if (audio.bus) {
+    GstMessage *msg;
+    while ((msg = gst_bus_pop(audio.bus)) != nullptr) {
+      BusCallback(audio.bus, msg, this);
+      gst_message_unref(msg);
+    }
+  }
+}
+
 void cGstDevice::Shutdown(void)
 {
   cMutexLock lock(&mutex);
@@ -503,14 +524,12 @@ void cGstDevice::Shutdown(void)
 
   if (video.pipeline) {
     gst_element_set_state(video.pipeline, GST_STATE_NULL);
-    if (video.watchId) g_source_remove(video.watchId);
     if (video.bus) gst_object_unref(video.bus);
     gst_object_unref(video.pipeline);
     video.pipeline = nullptr;
   }
   if (audio.pipeline) {
     gst_element_set_state(audio.pipeline, GST_STATE_NULL);
-    if (audio.watchId) g_source_remove(audio.watchId);
     if (audio.bus) gst_object_unref(audio.bus);
     gst_object_unref(audio.pipeline);
     audio.pipeline = nullptr;
