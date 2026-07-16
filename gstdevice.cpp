@@ -607,10 +607,10 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
       int pid = TsPid(p);
 
       if (pid == PATPID)
-        PatPmtParser()->ParsePat(p, TS_SIZE);
-      else if (PatPmtParser()->IsPmtPid(pid))
-        PatPmtParser()->ParsePmt(p, TS_SIZE);
-      else if (pid == PatPmtParser()->Vpid()) {
+        patPmtParser.ParsePat(p, TS_SIZE);
+      else if (patPmtParser.IsPmtPid(pid))
+        patPmtParser.ParsePmt(p, TS_SIZE);
+      else if (pid == patPmtParser.Vpid()) {
         if (TsPayloadStart(p)) {
           int l;
           const uchar *pes;
@@ -621,7 +621,7 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
         tsToPesVideo.PutTs(p, TS_SIZE);
       }
       else if (!VideoOnly) {
-        int apid = PatPmtParser()->Apid(0);
+        int apid = patPmtParser.Apid(0);
         if (apid > 0 && pid == apid) {
           if (TsPayloadStart(p)) {
             int l;
