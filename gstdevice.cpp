@@ -173,6 +173,17 @@ bool cGstDevice::BuildVideoPipeline(void)
   gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decode, convert,
                     videoQueue, compositor, videosink, nullptr);
 
+  // Log every element decodebin auto-plugs internally (parsers, decoders,
+  // etc.) so we can confirm at runtime whether it picked a VA-API hardware
+  // decoder (element/factory names starting with "va"/"vaapi") or fell
+  // back to a software decoder (e.g. avdec_h264) - the latter is a common
+  // cause of the host CPU maxing out a core during playback.
+  g_signal_connect(decode, "deep-element-added", G_CALLBACK(+[](GstBin *, GstBin *, GstElement *element, gpointer) {
+    GstElementFactory *factory = gst_element_get_factory(element);
+    const char *factoryName = factory ? GST_OBJECT_NAME(factory) : "(unknown)";
+    isyslog("gstoutput: video decodebin auto-plugged: %s", factoryName);
+  }), nullptr);
+
   if (!gst_element_link(video.appsrc, parse)) {
     esyslog("gstoutput: failed to link appsrc -> h264parse");
     return false;
