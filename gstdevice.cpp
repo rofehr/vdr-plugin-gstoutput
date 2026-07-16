@@ -246,11 +246,23 @@ bool cGstDevice::BuildVideoPipeline(void)
                  nullptr);
     gst_caps_unref(osdCaps);
   }
-  GstElement *osdConvert = gst_element_factory_make("videoconvert", "osd-convert");
-  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, nullptr);
-  gst_element_link(osdAppsrc, osdConvert);
+  GstElement *osdConvert    = gst_element_factory_make("videoconvert", "osd-convert");
+  GstElement *osdCapsFilter = gst_element_factory_make("capsfilter", "osd-capsfilter");
+  {
+    // Force the OSD branch to negotiate an alpha-capable format all the
+    // way to the compositor pad. Without this, videoconvert is free to
+    // pick any format compositor's sink pad accepts - including a
+    // non-alpha one - which silently drops our transparency and turns
+    // the (meant-to-be-transparent) OSD buffer into an opaque layer that
+    // blacks out the whole picture at zorder=1.
+    GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", nullptr);
+    g_object_set(osdCapsFilter, "caps", alphaCaps, nullptr);
+    gst_caps_unref(alphaCaps);
+  }
+  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, osdCapsFilter, nullptr);
+  gst_element_link_many(osdAppsrc, osdConvert, osdCapsFilter, nullptr);
 
-  GstPad *osdSrcPad  = gst_element_get_static_pad(osdConvert, "src");
+  GstPad *osdSrcPad  = gst_element_get_static_pad(osdCapsFilter, "src");
   GstPad *mixerSink1 = gst_element_request_pad_simple(compositor, "sink_%u");
   gst_pad_link(osdSrcPad, mixerSink1);
   // OSD layer always on top, alpha-blended
