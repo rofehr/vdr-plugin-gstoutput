@@ -41,6 +41,7 @@ private:
   // not ready-made PES packets - see PlayTs()).
   cTsToPes tsToPesVideo;
   cTsToPes tsToPesAudio;
+  cPatPmtParser ownPatPmtParser; // cDevice::patPmtParser is private in this VDR version, so we track our own
 
   GstElement *compositor = nullptr; // mixes video + OSD overlay
   GstElement *osdAppsrc  = nullptr; // OSD bitmap feed, see cGstOsdProvider
