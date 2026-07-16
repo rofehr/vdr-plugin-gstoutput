@@ -3,6 +3,7 @@
 
 #include <vdr/device.h>
 #include <vdr/thread.h>
+#include <vdr/remux.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 
@@ -34,6 +35,12 @@ private:
 
   cGstStream video;
   cGstStream audio;
+
+  // TS -> PES reassembly, driven from our PlayTs() override (VDR's live TV
+  // and TS-based recording playback deliver raw 188-byte TS packets here,
+  // not ready-made PES packets - see PlayTs()).
+  cTsToPes tsToPesVideo;
+  cTsToPes tsToPesAudio;
 
   GstElement *compositor = nullptr; // mixes video + OSD overlay
   GstElement *osdAppsrc  = nullptr; // OSD bitmap feed, see cGstOsdProvider
@@ -71,6 +78,7 @@ protected:
 
   virtual int PlayVideo(const uchar *Data, int Length);
   virtual int PlayAudio(const uchar *Data, int Length, uchar Id);
+  virtual int PlayTs(const uchar *Data, int Length, bool VideoOnly = false);
 
   virtual bool HasIBPTrickSpeed(void) { return true; }
   virtual int64_t GetSTC(void);

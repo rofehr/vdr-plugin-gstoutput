@@ -169,6 +169,11 @@ bool cGstDevice::BuildVideoPipeline(void)
   // the stream's caps, so we hook "pad-added" to complete the link.
   g_signal_connect(decode, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *pad, gpointer data) {
     GstElement *convert = GST_ELEMENT(data);
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    gchar *capsStr = caps ? gst_caps_to_string(caps) : g_strdup("(no caps yet)");
+    isyslog("gstoutput: video decodebin pad-added, caps=%s", capsStr);
+    g_free(capsStr);
+    if (caps) gst_caps_unref(caps);
     GstPad *sinkpad = gst_element_get_static_pad(convert, "sink");
     if (!gst_pad_is_linked(sinkpad))
       gst_pad_link(pad, sinkpad);
@@ -227,14 +232,30 @@ bool cGstDevice::BuildAudioPipeline(void)
   GstElement *convert  = gst_element_factory_make("audioconvert", "audio-convert");
   GstElement *resample = gst_element_factory_make("audioresample", "audio-resample");
   GstElement *sink     = gst_element_factory_make(*audioSinkName, "audio-sink");
+  GstElement *queue    = gst_element_factory_make("queue", "audio-elastic-queue");
 
   if (sink && !strcmp(*audioSinkName, "alsasink")) {
-    // Larger ALSA period/buffer to absorb bursty delivery from VDR while
-    // PTS-based pacing (see PlayAudio() TODO) isn't wired up yet. Values
-    // are in microseconds.
+    // Previous 200000/20000 was a no-op for buffer-time (that's alsasink's
+    // own default!). Bump both meaningfully to give real headroom against
+    // bursty delivery (channel switches, recording playback catching up)
+    // instead of the driver's stock real-time-only sizing. Values in
+    // microseconds.
     g_object_set(sink,
-                 "buffer-time", (gint64)200000,
-                 "latency-time", (gint64)20000,
+                 "buffer-time", (gint64)1000000, // 1s
+                 "latency-time", (gint64)40000,  // 40ms
+                 nullptr);
+  }
+
+  if (queue) {
+    // Elastic, time-bounded buffer ahead of the sink: absorbs bursts from
+    // VDR/decodebin without blocking the appsrc thread, and drops the
+    // *oldest* data instead of overflowing ALSA's ring buffer if a burst
+    // is sustained rather than momentary.
+    g_object_set(queue,
+                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-bytes", (guint)0,
+                 "max-size-buffers", (guint)0,
+                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest on overrun
                  nullptr);
   }
 
@@ -244,6 +265,7 @@ bool cGstDevice::BuildAudioPipeline(void)
     { "decodebin",      decode },
     { "audioconvert",   convert },
     { "audioresample",  resample },
+    { "queue",          queue },
     { *audioSinkName,   sink },
   };
   bool missing = false;
@@ -257,20 +279,25 @@ bool cGstDevice::BuildAudioPipeline(void)
   if (missing)
     return false;
 
-  gst_bin_add_many(GST_BIN(audio.pipeline), audio.appsrc, parse, decode, convert, resample, sink, nullptr);
+  gst_bin_add_many(GST_BIN(audio.pipeline), audio.appsrc, parse, decode, convert, resample, queue, sink, nullptr);
 
   gst_element_link(audio.appsrc, parse);
   gst_element_link(parse, decode);
 
   g_signal_connect(decode, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *pad, gpointer data) {
     GstElement *convert = GST_ELEMENT(data);
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    gchar *capsStr = caps ? gst_caps_to_string(caps) : g_strdup("(no caps yet)");
+    isyslog("gstoutput: audio decodebin pad-added, caps=%s", capsStr);
+    g_free(capsStr);
+    if (caps) gst_caps_unref(caps);
     GstPad *sinkpad = gst_element_get_static_pad(convert, "sink");
     if (!gst_pad_is_linked(sinkpad))
       gst_pad_link(pad, sinkpad);
     gst_object_unref(sinkpad);
   }), convert);
 
-  gst_element_link_many(convert, resample, sink, nullptr);
+  gst_element_link_many(convert, resample, queue, sink, nullptr);
   audio.sink = sink;
 
   audio.bus = gst_pipeline_get_bus(GST_PIPELINE(audio.pipeline));
@@ -339,9 +366,35 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
       GError *err = nullptr;
       gchar *dbg = nullptr;
       gst_message_parse_error(msg, &err, &dbg);
-      esyslog("gstoutput: GStreamer error: %s (%s)", err->message, dbg ? dbg : "no debug info");
+      esyslog("gstoutput: GStreamer error on %s: %s (%s)",
+              GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), err->message, dbg ? dbg : "no debug info");
       g_clear_error(&err);
       g_free(dbg);
+      break;
+    }
+    case GST_MESSAGE_WARNING: {
+      GError *err = nullptr;
+      gchar *dbg = nullptr;
+      gst_message_parse_warning(msg, &err, &dbg);
+      esyslog("gstoutput: GStreamer warning on %s: %s (%s)",
+              GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), err->message, dbg ? dbg : "no debug info");
+      g_clear_error(&err);
+      g_free(dbg);
+      break;
+    }
+    case GST_MESSAGE_STATE_CHANGED: {
+      // Only log state changes of the pipelines themselves, not every
+      // internal element, to keep this readable.
+      if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->video.pipeline) ||
+          GST_MESSAGE_SRC(msg) == GST_OBJECT(self->audio.pipeline)) {
+        GstState oldState, newState, pending;
+        gst_message_parse_state_changed(msg, &oldState, &newState, &pending);
+        isyslog("gstoutput: %s state changed: %s -> %s (pending: %s)",
+                GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)),
+                gst_element_state_get_name(oldState),
+                gst_element_state_get_name(newState),
+                gst_element_state_get_name(pending));
+      }
       break;
     }
     case GST_MESSAGE_EOS:
@@ -350,7 +403,6 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
     default:
       break;
   }
-  (void)self;
   return TRUE;
 }
 
@@ -386,6 +438,7 @@ void cGstDevice::Shutdown(void)
 bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
 {
   cMutexLock lock(&mutex);
+  isyslog("gstoutput: SetPlayMode(%d) called", (int)PlayMode);
   switch (PlayMode) {
     case pmNone:
       gst_element_set_state(video.pipeline, GST_STATE_READY);
@@ -434,6 +487,9 @@ void cGstDevice::Clear(void)
     audioPtsState = cPtsUnwrap();
   }
 
+  tsToPesVideo.Reset();
+  tsToPesAudio.Reset();
+
   cDevice::Clear();
 }
 
@@ -467,6 +523,14 @@ void cGstDevice::StillPicture(const uchar *Data, int Length)
 
 int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
+  static long callCount = 0;
+  if (callCount == 0)
+    isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
+            Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
+            Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
+  if (++callCount % 200 == 0)
+    isyslog("gstoutput: PlayVideo() called %ld times so far", callCount);
+
   if (!video.appsrc || Length <= 0)
     return Length;
 
@@ -489,6 +553,12 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 
 int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 {
+  static long callCount = 0;
+  if (callCount == 0)
+    isyslog("gstoutput: PlayAudio() called for the first time (Length=%d, Id=%d)", Length, Id);
+  if (++callCount % 200 == 0)
+    isyslog("gstoutput: PlayAudio() called %ld times so far", callCount);
+
   if (!audio.appsrc || Length <= 0)
     return Length;
 
@@ -507,6 +577,69 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
     return 0;
   }
   return Length;
+}
+
+// VDR's live TV and TS-based recording playback deliver raw 188-byte TS
+// packets here (not ready-made PES packets), via cDvbPlayer/cTransfer ->
+// cDevice::PlayTs(). We track PAT/PMT ourselves (via the protected
+// PatPmtParser() accessor) to learn the current video/audio PIDs, and
+// reassemble each stream's PES packets with cTsToPes - mirroring the
+// exact pattern VDR itself uses internally in cDevice::StillPicture():
+// on TsPayloadStart(), drain whatever PES data has accumulated so far,
+// Reset(), *then* start accumulating the new packet.
+int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
+{
+  if (!Data || Length <= 0)
+    return 0;
+
+  static long tsCallCount = 0;
+  if (tsCallCount == 0)
+    isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
+  if (++tsCallCount % 500 == 0)
+    isyslog("gstoutput: PlayTs() called %ld times so far", tsCallCount);
+
+  int played = 0;
+  const uchar *p = Data;
+  int remaining = Length;
+
+  while (remaining >= TS_SIZE) {
+    if (!TsError(p)) {
+      int pid = TsPid(p);
+
+      if (pid == PATPID)
+        PatPmtParser()->ParsePat(p, TS_SIZE);
+      else if (PatPmtParser()->IsPmtPid(pid))
+        PatPmtParser()->ParsePmt(p, TS_SIZE);
+      else if (pid == PatPmtParser()->Vpid()) {
+        if (TsPayloadStart(p)) {
+          int l;
+          const uchar *pes;
+          while ((pes = tsToPesVideo.GetPes(l)) != nullptr)
+            PlayVideo(pes, l);
+          tsToPesVideo.Reset();
+        }
+        tsToPesVideo.PutTs(p, TS_SIZE);
+      }
+      else if (!VideoOnly) {
+        int apid = PatPmtParser()->Apid(0);
+        if (apid > 0 && pid == apid) {
+          if (TsPayloadStart(p)) {
+            int l;
+            const uchar *pes;
+            while ((pes = tsToPesAudio.GetPes(l)) != nullptr)
+              PlayAudio(pes, l, pid);
+            tsToPesAudio.Reset();
+          }
+          tsToPesAudio.PutTs(p, TS_SIZE);
+        }
+      }
+    }
+
+    played    += TS_SIZE;
+    p         += TS_SIZE;
+    remaining -= TS_SIZE;
+  }
+  return played;
 }
 
 int64_t cGstDevice::GetSTC(void)
