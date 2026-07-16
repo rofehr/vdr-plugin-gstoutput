@@ -224,11 +224,28 @@ bool cGstDevice::BuildVideoPipeline(void)
   // Request a second compositor sink pad for the OSD overlay branch;
   // cGstOsdProvider owns an appsrc that feeds into this pad.
   osdAppsrc = gst_element_factory_make("appsrc", "osd-src");
-  g_object_set(osdAppsrc,
-               "is-live", TRUE,
-               "format", GST_FORMAT_TIME,
-               "do-timestamp", FALSE,
-               nullptr);
+  {
+    // Raw video has no self-describing byte stream (unlike H.264), so
+    // without explicit caps here GStreamer has no way to know the
+    // width/height/format of what we're pushing - the result is exactly
+    // the "garbage / checkerboard" look, not a clean OSD overlay.
+    // NOTE: 1920x1080 matches the hardcoded value in cGstOsd (gstosd.cpp);
+    // both need to move together to a real queried resolution eventually
+    // (see README TODOs).
+    GstCaps *osdCaps = gst_caps_new_simple("video/x-raw",
+                                            "format",    G_TYPE_STRING, "BGRA",
+                                            "width",     G_TYPE_INT,    1920,
+                                            "height",    G_TYPE_INT,    1080,
+                                            "framerate", GST_TYPE_FRACTION, 0, 1,
+                                            nullptr);
+    g_object_set(osdAppsrc,
+                 "is-live", TRUE,
+                 "format", GST_FORMAT_TIME,
+                 "do-timestamp", FALSE,
+                 "caps", osdCaps,
+                 nullptr);
+    gst_caps_unref(osdCaps);
+  }
   GstElement *osdConvert = gst_element_factory_make("videoconvert", "osd-convert");
   gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, nullptr);
   gst_element_link(osdAppsrc, osdConvert);
@@ -240,8 +257,14 @@ bool cGstDevice::BuildVideoPipeline(void)
   g_object_set(mixerSink1, "zorder", 1, nullptr);
   gst_object_unref(osdSrcPad);
 
+  // Explicit black background rather than relying on this GStreamer
+  // version's default - rules out compositor's own placeholder pattern
+  // as a source of visual artifacts entirely.
+  g_object_set(compositor, "background", 1 /* GST_COMPOSITOR_BACKGROUND_BLACK */, nullptr);
+
   video.bus = gst_pipeline_get_bus(GST_PIPELINE(video.pipeline));
   video.watchId = gst_bus_add_watch(video.bus, BusCallback, this);
+
 
   return true;
 }
@@ -558,11 +581,11 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
   static long callCount = 0;
   if (callCount == 0)
-    //isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
-    //        Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
-    //        Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
-  //if (++callCount % 200 == 0)
-  //  isyslog("gstoutput: PlayVideo() called %ld times so far", callCount);
+    isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
+            Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
+            Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
+  if (++callCount % 200 == 0)
+    isyslog("gstoutput: PlayVideo() called %ld times so far", callCount);
 
   if (!video.appsrc || Length <= 0)
     return Length;
@@ -587,10 +610,10 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 {
   static long callCount = 0;
-  //if (callCount == 0)
-  //  isyslog("gstoutput: PlayAudio() called for the first time (Length=%d, Id=%d)", Length, Id);
-  //if (++callCount % 200 == 0)
-  //  isyslog("gstoutput: PlayAudio() called %ld times so far", callCount);
+  if (callCount == 0)
+    isyslog("gstoutput: PlayAudio() called for the first time (Length=%d, Id=%d)", Length, Id);
+  if (++callCount % 200 == 0)
+    isyslog("gstoutput: PlayAudio() called %ld times so far", callCount);
 
   if (!audio.appsrc || Length <= 0)
     return Length;
@@ -626,10 +649,10 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
     return 0;
 
   static long tsCallCount = 0;
- // if (tsCallCount == 0)
- //   isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
-  //if (++tsCallCount % 500 == 0)
-  //  isyslog("gstoutput: PlayTs() called %ld times so far", tsCallCount);
+  if (tsCallCount == 0)
+    isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
+  if (++tsCallCount % 500 == 0)
+    isyslog("gstoutput: PlayTs() called %ld times so far", tsCallCount);
 
   int played = 0;
   const uchar *p = Data;
