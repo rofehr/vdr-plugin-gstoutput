@@ -160,6 +160,7 @@ bool cGstDevice::BuildVideoPipeline(void)
                "format", GST_FORMAT_TIME,
                "do-timestamp", FALSE, // we set PTS ourselves from VDR's STC
                "block", TRUE,
+			   "sync", FALSE, 
                "max-bytes", (guint64)(4 * 1024 * 1024),
                nullptr);
 
