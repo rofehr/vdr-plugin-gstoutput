@@ -60,6 +60,28 @@ bool ExtractPesPts(const uchar *Data, int Length, int64_t &Pts90k)
   return true;
 }
 
+// Returns the byte offset in a PES packet where the actual elementary
+// stream payload begins - i.e. past the PES header itself. We were
+// previously pushing the *entire* PES packet (header included) into
+// appsrc/h264parse, which occasionally corrupts NAL unit boundary
+// detection (observed as "unknown NAL unit type id 0, skip" from the
+// VA-API H.264 decoder, eventually escalating into a fatal streaming
+// error). Falls back to 6 (bare fixed header, no optional fields) or 0
+// (not PES-framed at all - e.g. a raw continuation fragment, pass through
+// unmodified) if this doesn't look like a standard PES optional header.
+int PesPayloadOffset(const uchar *Data, int Length)
+{
+  if (Length < 9 || Data[0] != 0x00 || Data[1] != 0x00 || Data[2] != 0x01)
+    return 0;
+  if ((Data[6] & 0xC0) != 0x80)
+    return 6;
+  int headerDataLen = Data[8];
+  int offset = 9 + headerDataLen;
+  if (offset > Length)
+    return Length; // malformed/truncated - avoid a negative payload length
+  return offset;
+}
+
 } // namespace
 
 cGstDevice::cGstDevice(const char *VideoSink, const char *AudioSink, const char *Connector)
@@ -82,7 +104,7 @@ bool cGstDevice::Init(void)
     int argc = 0;
     gst_init(&argc, nullptr);
 	
-    // Setzt das globale Debug-Level im Code auf 3 (INFO)
+		// Setzt das globale Debug-Level im Code auf 3 (INFO)
     gst_debug_set_default_threshold(GST_LEVEL_INFO);
 
   }
@@ -674,11 +696,19 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
   if (!video.appsrc || Length <= 0)
     return Length;
 
-  GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
-  gst_buffer_fill(buf, 0, Data, Length);
-
   int64_t rawPts90k;
-  if (ExtractPesPts(Data, Length, rawPts90k))
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
+
+  int payloadOffset = PesPayloadOffset(Data, Length);
+  const uchar *payload = Data + payloadOffset;
+  int payloadLength = Length - payloadOffset;
+  if (payloadLength <= 0)
+    return Length;
+
+  GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
+  gst_buffer_fill(buf, 0, payload, payloadLength);
+
+  if (havePts)
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
@@ -702,11 +732,19 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
   if (!audio.appsrc || Length <= 0)
     return Length;
 
-  GstBuffer *buf = gst_buffer_new_allocate(nullptr, Length, nullptr);
-  gst_buffer_fill(buf, 0, Data, Length);
-
   int64_t rawPts90k;
-  if (ExtractPesPts(Data, Length, rawPts90k))
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
+
+  int payloadOffset = PesPayloadOffset(Data, Length);
+  const uchar *payload = Data + payloadOffset;
+  int payloadLength = Length - payloadOffset;
+  if (payloadLength <= 0)
+    return Length;
+
+  GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
+  gst_buffer_fill(buf, 0, payload, payloadLength);
+
+  if (havePts)
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
