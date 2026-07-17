@@ -83,7 +83,7 @@ bool cGstDevice::Init(void)
     gst_init(&argc, nullptr);
 	
 	// Setzt das globale Debug-Level im Code auf 3 (INFO)
-    gst_debug_set_default_threshold(GST_LEVEL_INFO);
+    gst_debug_set_default_threshold(GST_LEVEL_DEBUG);
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
