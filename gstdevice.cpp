@@ -103,7 +103,7 @@ bool cGstDevice::Init(void)
   if (!gst_is_initialized()) {
     int argc = 0;
     gst_init(&argc, nullptr);
-    gst_debug_set_default_threshold(GST_LEVEL_INFO);
+    gst_debug_set_default_threshold(GST_LEVEL_ERROR);
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
