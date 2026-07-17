@@ -82,8 +82,9 @@ bool cGstDevice::Init(void)
     int argc = 0;
     gst_init(&argc, nullptr);
 	
-	// Setzt das globale Debug-Level im Code auf 3 (INFO)
-    gst_debug_set_default_threshold(GST_LEVEL_DEBUG);
+    // Setzt das globale Debug-Level im Code auf 3 (INFO)
+    gst_debug_set_default_threshold(GST_LEVEL_INFO);
+
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
@@ -453,14 +454,18 @@ void cGstDevice::SyncPipelineClocks(void)
   if (!sharedClock)
     sharedClock = gst_system_clock_obtain();
 
+  // Only share the clock *instance* between the two pipelines. We
+  // deliberately no longer force an explicit base_time here: doing so
+  // fights GStreamer's own automatic latency-compensated base_time
+  // assignment on the PAUSED->PLAYING transition (gst_bin_do_latency()),
+  // which is the most likely explanation for kmssink's "too late, buffers
+  // dropped" warnings we were seeing - our forced base_time didn't leave
+  // room for the pipeline's actual (VA-API decode + queues + compositor)
+  // latency at all. Sharing just the clock instance still gives both
+  // pipelines a common time reference; each one computes its own
+  // correctly-latency-adjusted base_time against it when it goes PLAYING.
   gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
   gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
-
-  GstClockTime now = gst_clock_get_time(sharedClock);
-  gst_element_set_base_time(video.pipeline, now);
-  gst_element_set_base_time(audio.pipeline, now);
-  gst_element_set_start_time(video.pipeline, GST_CLOCK_TIME_NONE); // don't let auto-flush-start rebase us
-  gst_element_set_start_time(audio.pipeline, GST_CLOCK_TIME_NONE);
 }
 
 
