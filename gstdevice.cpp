@@ -294,7 +294,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     g_object_set(osdAppsrc,
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
-                 "do-timestamp", FALSE,
+                 "do-timestamp", TRUE,
                  "caps", osdCaps,
                  nullptr);
     gst_caps_unref(osdCaps);
