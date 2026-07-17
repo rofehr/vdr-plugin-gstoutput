@@ -103,10 +103,7 @@ bool cGstDevice::Init(void)
   if (!gst_is_initialized()) {
     int argc = 0;
     gst_init(&argc, nullptr);
-	
-		// Setzt das globale Debug-Level im Code auf 3 (INFO)
     gst_debug_set_default_threshold(GST_LEVEL_INFO);
-
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
@@ -202,6 +199,14 @@ bool cGstDevice::BuildVideoPipeline(void)
                  nullptr);
 
   g_object_set(videosink, "sync", TRUE, nullptr);
+  // Marginal (single-digit-ms) lateness was triggering vaapidecode's QoS
+  // frame-dropping via QOS events sent upstream from this sink, which in
+  // turn seems to destabilize vaapidecodebin's internal queue - observed
+  // as "Dropping frame due to QoS" immediately followed by a fatal
+  // streaming error / spontaneous EOS. Disabling QoS reporting trades
+  // graceful frame-dropping under sustained real overload for not
+  // triggering this crash on brief, likely-harmless timing jitter.
+  g_object_set(videosink, "qos", FALSE, nullptr);
 
   if (videoQueue) {
     // Same rationale as the audio queue: decouples the sink's real-time
