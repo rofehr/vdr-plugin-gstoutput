@@ -104,6 +104,12 @@ bool cGstDevice::Init(void)
     int argc = 0;
     gst_init(&argc, nullptr);
     //gst_debug_set_default_threshold(GST_LEVEL_ERROR);
+	gst_debug_set_threshold_for_name("gst_base_sink", GST_LEVEL_LOG);
+	gst_debug_set_threshold_for_name("gst_clock", GST_LEVEL_LOG);
+	gst_debug_set_threshold_for_name("gst_qos", GST_LEVEL_LOG);
+	gst_debug_set_threshold_for_name("v4l2*", GST_LEVEL_DEBUG);
+	gst_debug_set_threshold_for_name("*kmssink*", GST_LEVEL_LOG);
+
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
