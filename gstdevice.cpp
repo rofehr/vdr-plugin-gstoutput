@@ -725,8 +725,10 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
   gst_buffer_fill(buf, 0, payload, payloadLength);
 
   if (havePts)
+  {
 	GST_BUFFER_DURATION(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
+  }
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
 
@@ -762,8 +764,10 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
   gst_buffer_fill(buf, 0, payload, payloadLength);
 
   if (havePts)
+  {
 	GST_BUFFER_DURATION(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
+  }
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
 
