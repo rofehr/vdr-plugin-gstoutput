@@ -270,6 +270,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   }
   GstElement *osdConvert    = gst_element_factory_make("videoconvert", "osd-convert");
   GstElement *osdCapsFilter = gst_element_factory_make("capsfilter", "osd-capsfilter");
+  GstElement *osdQueue      = gst_element_factory_make("queue", "osd-queue");
   {
     // Force the OSD branch to negotiate an alpha-capable format all the
     // way to the compositor pad. Without this, videoconvert is free to
@@ -281,10 +282,25 @@ bool cGstDevice::BuildVideoPipeline(void)
     g_object_set(osdCapsFilter, "caps", alphaCaps, nullptr);
     gst_caps_unref(alphaCaps);
   }
-  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, osdCapsFilter, nullptr);
-  gst_element_link_many(osdAppsrc, osdConvert, osdCapsFilter, nullptr);
+  if (osdQueue) {
+    // Without ANY buffering element in this branch, it reports a
+    // max-latency of 0 to compositor's aggregator latency negotiation,
+    // which conflicts with the video branch's non-zero min-latency
+    // requirement ("Impossible to configure latency: max 0 < min ...")
+    // and breaks the whole pipeline - not just the OSD overlay. A small
+    // queue is enough; OSD updates are infrequent and don't need the
+    // half-second of headroom the video/audio elastic queues carry.
+    g_object_set(osdQueue,
+                 "max-size-time", (guint64)(200 * GST_MSECOND),
+                 "max-size-bytes", (guint)0,
+                 "max-size-buffers", (guint)0,
+                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM
+                 nullptr);
+  }
+  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, osdCapsFilter, osdQueue, nullptr);
+  gst_element_link_many(osdAppsrc, osdConvert, osdCapsFilter, osdQueue, nullptr);
 
-  GstPad *osdSrcPad  = gst_element_get_static_pad(osdCapsFilter, "src");
+  GstPad *osdSrcPad  = gst_element_get_static_pad(osdQueue, "src");
   GstPad *mixerSink1 = gst_element_request_pad_simple(compositor, "sink_%u");
   gst_pad_link(osdSrcPad, mixerSink1);
   // OSD layer always on top, alpha-blended
