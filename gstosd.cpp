@@ -32,7 +32,7 @@ void cGstOsd::SetActive(bool Active)
     GstBuffer *buf = gst_buffer_new_allocate(nullptr, (gsize)screenWidth * screenHeight * 4, nullptr);
     gst_buffer_memset(buf, 0, 0, gst_buffer_get_size(buf));
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
-    gst_app_src_push_buffer(GST_APP_SRC(device->OsdAppSrc()), buf);
+    device->PushOsdBuffer(buf);
   }
 }
 
@@ -83,10 +83,8 @@ void cGstOsd::Flush(void)
     }
     gst_buffer_unmap(buf, &map);
 
-    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // live overlay, no timing needed
-    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(device->OsdAppSrc()), buf);
-    if (ret != GST_FLOW_OK)
-      esyslog("gstoutput: OSD appsrc push failed (%d)", ret);
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // re-timestamped by do-timestamp=TRUE
+    device->PushOsdBuffer(buf);
 
     bitmap->Clean();
   }

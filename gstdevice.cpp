@@ -134,9 +134,7 @@ void cGstDevice::PushInitialOsdFrame(void)
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, (gsize)w * h * 4, nullptr);
   gst_buffer_memset(buf, 0, 0, gst_buffer_get_size(buf)); // fully transparent (alpha=0)
   GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
-  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(osdAppsrc), buf);
-  if (ret != GST_FLOW_OK)
-    esyslog("gstoutput: initial OSD preroll frame push failed (%d)", ret);
+  PushOsdBuffer(buf); // also seeds the heartbeat cache, see PushOsdBuffer()/OsdHeartbeat()
 }
 
 // -----------------------------------------------------------------------
@@ -290,15 +288,15 @@ bool cGstDevice::BuildVideoPipeline(void)
                                             "framerate", GST_TYPE_FRACTION, 0, 1,
                                             nullptr);
     g_object_set(osdAppsrc,
-                 // Unlike video/audio, OSD isn't a continuous live stream -
-                 // it's updated only when VDR actually redraws something.
-                 // With is-live=TRUE, compositor's aggregator seems to
-                 // expect continuous fresh buffers on this pad and stalls
-                 // the *entire* output once OSD goes quiet (e.g. plain
-                 // live TV with no menu open) - "just a frozen still
-                 // image". is-live=FALSE lets it hold the last buffer
-                 // indefinitely instead, which is what we actually want.
-                 "is-live", FALSE,
+                 // Genuinely needs to be TRUE: with is-live=FALSE,
+                 // compositor's aggregator seems to assume a next buffer
+                 // is always guaranteed to eventually arrive on this pad
+                 // and blocks the *entire* output waiting for it once OSD
+                 // goes quiet - worse than the is-live=TRUE freeze (no
+                 // picture at all instead of a stuck frame). Fixed
+                 // instead via a periodic heartbeat re-push - see
+                 // PushOsdBuffer()/OsdHeartbeat() in gstdevice.cpp.
+                 "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
                  // compositor's video-aggregator base class *requires*
                  // every buffer to carry a valid PTS ("Need timestamped
@@ -578,6 +576,50 @@ void cGstDevice::PollBus(void)
       gst_message_unref(msg);
     }
   }
+
+  OsdHeartbeat();
+}
+
+// Called by cGstOsd (gstosd.cpp) instead of pushing to osdAppsrc directly,
+// so we can keep a cached copy around for the heartbeat below.
+void cGstDevice::PushOsdBuffer(GstBuffer *Buffer)
+{
+  if (!osdAppsrc) {
+    gst_buffer_unref(Buffer);
+    return;
+  }
+
+  cMutexLock lock(&osdMutex);
+  if (lastOsdBuffer)
+    gst_buffer_unref(lastOsdBuffer);
+  lastOsdBuffer = gst_buffer_ref(Buffer);
+  osdHeartbeatTimer.Set(OSD_HEARTBEAT_MS);
+
+  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(osdAppsrc), Buffer); // takes ownership
+  if (ret != GST_FLOW_OK)
+    esyslog("gstoutput: OSD appsrc push failed (%d)", ret);
+}
+
+// compositor's live OSD pad needs to see buffers often enough that its
+// aggregator never considers the pad stalled - see the is-live comment on
+// osdAppsrc in BuildVideoPipeline(). VDR calls cPlugin::MainThreadHook()
+// (which calls PollBus(), which calls this) regularly regardless of
+// whether the OSD is actually changing, so plain live TV with no menu
+// open still gets a steady trickle of re-sent (unchanged) OSD frames.
+void cGstDevice::OsdHeartbeat(void)
+{
+  if (!osdAppsrc)
+    return;
+  cMutexLock lock(&osdMutex);
+  if (!lastOsdBuffer || !osdHeartbeatTimer.TimedOut())
+    return;
+
+  GstBuffer *copy = gst_buffer_copy(lastOsdBuffer);
+  GST_BUFFER_PTS(copy) = GST_CLOCK_TIME_NONE; // re-timestamped fresh by do-timestamp=TRUE
+  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(osdAppsrc), copy);
+  if (ret != GST_FLOW_OK)
+    esyslog("gstoutput: OSD heartbeat push failed (%d)", ret);
+  osdHeartbeatTimer.Set(OSD_HEARTBEAT_MS);
 }
 
 void cGstDevice::Shutdown(void)
@@ -600,6 +642,14 @@ void cGstDevice::Shutdown(void)
   }
   initialized = false;
   playing = false;
+
+  {
+    cMutexLock osdLock(&osdMutex);
+    if (lastOsdBuffer) {
+      gst_buffer_unref(lastOsdBuffer);
+      lastOsdBuffer = nullptr;
+    }
+  }
 
   if (sharedClock) {
     gst_object_unref(sharedClock);

@@ -4,6 +4,7 @@
 #include <vdr/device.h>
 #include <vdr/thread.h>
 #include <vdr/remux.h>
+#include <vdr/tools.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 
@@ -45,6 +46,14 @@ private:
 
   GstElement *compositor = nullptr; // mixes video + OSD overlay
   GstElement *osdAppsrc  = nullptr; // OSD bitmap feed, see cGstOsdProvider
+
+  // Periodic re-push of the last OSD frame so compositor's live OSD pad
+  // never goes quiet for long enough to stall the whole output (see
+  // PushOsdBuffer()/OsdHeartbeat() in gstdevice.cpp).
+  GstBuffer *lastOsdBuffer = nullptr;
+  cMutex     osdMutex;
+  cTimeMs    osdHeartbeatTimer;
+  static const int OSD_HEARTBEAT_MS = 200;
 
   cMutex mutex;
   bool playing = false;
@@ -108,8 +117,12 @@ public:
   void ResumeDisplay(void);
 
   // Used by cGstOsdProvider to push a rendered OSD frame into the mixer.
+  // Goes through here (rather than the raw appsrc) so we can cache a copy
+  // for the periodic heartbeat re-push - see gstdevice.cpp.
   GstElement *OsdAppSrc(void) { return osdAppsrc; }
   GstElement *Compositor(void) { return compositor; }
+  void PushOsdBuffer(GstBuffer *Buffer);
+  void OsdHeartbeat(void);
 };
 
 #endif
