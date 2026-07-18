@@ -290,7 +290,15 @@ bool cGstDevice::BuildVideoPipeline(void)
                                             "framerate", GST_TYPE_FRACTION, 0, 1,
                                             nullptr);
     g_object_set(osdAppsrc,
-                 "is-live", TRUE,
+                 // Unlike video/audio, OSD isn't a continuous live stream -
+                 // it's updated only when VDR actually redraws something.
+                 // With is-live=TRUE, compositor's aggregator seems to
+                 // expect continuous fresh buffers on this pad and stalls
+                 // the *entire* output once OSD goes quiet (e.g. plain
+                 // live TV with no menu open) - "just a frozen still
+                 // image". is-live=FALSE lets it hold the last buffer
+                 // indefinitely instead, which is what we actually want.
+                 "is-live", FALSE,
                  "format", GST_FORMAT_TIME,
                  // compositor's video-aggregator base class *requires*
                  // every buffer to carry a valid PTS ("Need timestamped
