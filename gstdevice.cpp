@@ -103,13 +103,6 @@ bool cGstDevice::Init(void)
   if (!gst_is_initialized()) {
     int argc = 0;
     gst_init(&argc, nullptr);
-    //gst_debug_set_default_threshold(GST_LEVEL_ERROR);
-	gst_debug_set_threshold_for_name("gst_base_sink", GST_LEVEL_LOG);
-	gst_debug_set_threshold_for_name("gst_clock", GST_LEVEL_LOG);
-	gst_debug_set_threshold_for_name("gst_qos", GST_LEVEL_LOG);
-	gst_debug_set_threshold_for_name("v4l2*", GST_LEVEL_DEBUG);
-	gst_debug_set_threshold_for_name("*kmssink*", GST_LEVEL_LOG);
-
   }
 
   if (!BuildVideoPipeline() || !BuildAudioPipeline()) {
@@ -166,7 +159,6 @@ bool cGstDevice::BuildVideoPipeline(void)
                "format", GST_FORMAT_TIME,
                "do-timestamp", FALSE, // we set PTS ourselves from VDR's STC
                "block", TRUE,
-			   "sync", FALSE, 
                "max-bytes", (guint64)(4 * 1024 * 1024),
                nullptr);
 
@@ -206,14 +198,13 @@ bool cGstDevice::BuildVideoPipeline(void)
                  nullptr);
 
   g_object_set(videosink, "sync", TRUE, nullptr);
-  // Marginal (single-digit-ms) lateness was triggering vaapidecode's QoS
-  // frame-dropping via QOS events sent upstream from this sink, which in
-  // turn seems to destabilize vaapidecodebin's internal queue - observed
-  // as "Dropping frame due to QoS" immediately followed by a fatal
-  // streaming error / spontaneous EOS. Disabling QoS reporting trades
-  // graceful frame-dropping under sustained real overload for not
-  // triggering this crash on brief, likely-harmless timing jitter.
-  g_object_set(videosink, "qos", FALSE, nullptr);
+  // Re-enabled: the actual root cause of the earlier crash cascade was
+  // compositor's video-aggregator rejecting our un-timestamped OSD
+  // buffers ("Need timestamped buffers!"), not vaapidecode's QoS-driven
+  // frame dropping - see the do-timestamp fix on osdAppsrc above. Leaving
+  // qos disabled here was only masking that, at the cost of the pipeline
+  // no longer being able to gracefully shed frames under real overload
+  // (visible as stutter instead of an occasional dropped frame).
 
   if (videoQueue) {
     // Same rationale as the audio queue: decouples the sink's real-time
@@ -301,6 +292,13 @@ bool cGstDevice::BuildVideoPipeline(void)
     g_object_set(osdAppsrc,
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
+                 // compositor's video-aggregator base class *requires*
+                 // every buffer to carry a valid PTS ("Need timestamped
+                 // buffers!" otherwise) - do-timestamp=TRUE has appsrc
+                 // stamp each buffer with the current pipeline running
+                 // time automatically, which is exactly what a live
+                 // overlay source needs and is far less error-prone than
+                 // us computing it by hand.
                  "do-timestamp", TRUE,
                  "caps", osdCaps,
                  nullptr);
@@ -698,16 +696,12 @@ void cGstDevice::StillPicture(const uchar *Data, int Length)
 int cGstDevice::PlayVideo(const uchar *Data, int Length)
 {
   static long callCount = 0;
-  
-  /*
   if (callCount == 0)
     isyslog("gstoutput: PlayVideo() called for the first time (Length=%d, first bytes=%02x %02x %02x %02x)",
             Length, Length > 0 ? Data[0] : 0, Length > 1 ? Data[1] : 0,
             Length > 2 ? Data[2] : 0, Length > 3 ? Data[3] : 0);
   if (++callCount % 200 == 0)
     isyslog("gstoutput: PlayVideo() called %ld times so far", callCount);
-  */
-   
 
   if (!video.appsrc || Length <= 0)
     return Length;
@@ -725,10 +719,7 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
   gst_buffer_fill(buf, 0, payload, payloadLength);
 
   if (havePts)
-  {
-	GST_BUFFER_DURATION(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
-  }
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
 
@@ -764,10 +755,7 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
   gst_buffer_fill(buf, 0, payload, payloadLength);
 
   if (havePts)
-  {
-	GST_BUFFER_DURATION(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
     GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
-  }
   else
     GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
 
@@ -793,14 +781,11 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
     return 0;
 
   static long tsCallCount = 0;
-
-  /*
   if (tsCallCount == 0)
     isyslog("gstoutput: PlayTs() called for the first time (Length=%d, VideoOnly=%d)", Length, VideoOnly);
   if (++tsCallCount % 500 == 0)
     isyslog("gstoutput: PlayTs() called %ld times so far", tsCallCount);
-  */ 
-  
+
   int played = 0;
   const uchar *p = Data;
   int remaining = Length;
