@@ -177,7 +177,8 @@ bool cGstDevice::BuildVideoPipeline(void)
   GstElement *parse    = gst_element_factory_make("h264parse", "video-parse");
   GstElement *decode    = gst_element_factory_make("decodebin", "video-decode");
   GstElement *convert   = gst_element_factory_make("videoconvert", "video-convert");
-  GstElement *videorate = gst_element_factory_make("videorate", "video-rate");
+  GstElement *videorate     = gst_element_factory_make("videorate", "video-rate");
+  GstElement *rateCapsFilter = gst_element_factory_make("capsfilter", "video-rate-caps");
   GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
   compositor            = gst_element_factory_make("compositor", "video-mixer");
   GstElement *videosink = gst_element_factory_make(*videoSinkName, "video-sink");
@@ -188,6 +189,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     { "decodebin",        decode },
     { "videoconvert",     convert },
     { "videorate",        videorate },
+    { "capsfilter",       rateCapsFilter },
     { "queue",            videoQueue },
     { "compositor",       compositor },
     { *videoSinkName,     videosink },
@@ -236,7 +238,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   }
 
   gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decode, convert,
-                    videorate, videoQueue, compositor, videosink, nullptr);
+                    videorate, rateCapsFilter, videoQueue, compositor, videosink, nullptr);
 
   // Log every element decodebin auto-plugs internally (parsers, decoders,
   // etc.) so we can confirm at runtime whether it picked a VA-API hardware
@@ -260,25 +262,50 @@ bool cGstDevice::BuildVideoPipeline(void)
 
   // decodebin exposes its source pad dynamically once it has determined
   // the stream's caps, so we hook "pad-added" to complete the link.
+  struct PadAddedCtx { GstElement *convert; GstElement *rateFilter; };
+  PadAddedCtx *padCtx = new PadAddedCtx{convert, rateCapsFilter};
   g_signal_connect(decode, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *pad, gpointer data) {
-    GstElement *convert = GST_ELEMENT(data);
+    PadAddedCtx *ctx = static_cast<PadAddedCtx *>(data);
     GstCaps *caps = gst_pad_get_current_caps(pad);
     gchar *capsStr = caps ? gst_caps_to_string(caps) : g_strdup("(no caps yet)");
     isyslog("gstoutput: video decodebin pad-added, caps=%s", capsStr);
     g_free(capsStr);
-    if (caps) gst_caps_unref(caps);
-    GstPad *sinkpad = gst_element_get_static_pad(convert, "sink");
+
+    if (caps) {
+      // Pin videorate's output to the *actual* decoded framerate rather
+      // than letting it negotiate an arbitrary default with whatever's
+      // downstream (observed to cause continuous judder/stutter when
+      // that default didn't match the real content rate, e.g. 50fps
+      // broadcasts getting silently retimed to 25fps).
+      GstStructure *s = gst_caps_get_structure(caps, 0);
+      gint fpsNum = 0, fpsDen = 1;
+      if (gst_structure_get_fraction(s, "framerate", &fpsNum, &fpsDen) && fpsNum > 0) {
+        GstCaps *rateCaps = gst_caps_new_simple("video/x-raw",
+                                                 "framerate", GST_TYPE_FRACTION, fpsNum, fpsDen,
+                                                 nullptr);
+        g_object_set(ctx->rateFilter, "caps", rateCaps, nullptr);
+        gst_caps_unref(rateCaps);
+        isyslog("gstoutput: pinning videorate output to %d/%d fps", fpsNum, fpsDen);
+      }
+      gst_caps_unref(caps);
+    }
+
+    GstPad *sinkpad = gst_element_get_static_pad(ctx->convert, "sink");
     if (!gst_pad_is_linked(sinkpad))
       gst_pad_link(pad, sinkpad);
     gst_object_unref(sinkpad);
-  }), convert);
+  }), padCtx);
 
   if (!gst_element_link(convert, videorate)) {
     esyslog("gstoutput: failed to link videoconvert -> videorate");
     return false;
   }
-  if (!gst_element_link(videorate, videoQueue)) {
-    esyslog("gstoutput: failed to link videorate -> queue");
+  if (!gst_element_link(videorate, rateCapsFilter)) {
+    esyslog("gstoutput: failed to link videorate -> capsfilter");
+    return false;
+  }
+  if (!gst_element_link(rateCapsFilter, videoQueue)) {
+    esyslog("gstoutput: failed to link capsfilter -> queue");
     return false;
   }
   if (!gst_element_link(videoQueue, compositor)) {
