@@ -101,6 +101,7 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
+	putenv((char *)"GST_DEBUG=*:3");  
     int argc = 0;
     gst_init(&argc, nullptr);
   }
