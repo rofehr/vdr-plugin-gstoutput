@@ -177,6 +177,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   GstElement *parse    = gst_element_factory_make("h264parse", "video-parse");
   GstElement *decode    = gst_element_factory_make("decodebin", "video-decode");
   GstElement *convert   = gst_element_factory_make("videoconvert", "video-convert");
+  GstElement *videorate = gst_element_factory_make("videorate", "video-rate");
   GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
   compositor            = gst_element_factory_make("compositor", "video-mixer");
   GstElement *videosink = gst_element_factory_make(*videoSinkName, "video-sink");
@@ -186,6 +187,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     { "h264parse",        parse },
     { "decodebin",        decode },
     { "videoconvert",     convert },
+    { "videorate",        videorate },
     { "queue",            videoQueue },
     { "compositor",       compositor },
     { *videoSinkName,     videosink },
@@ -234,7 +236,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   }
 
   gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decode, convert,
-                    videoQueue, compositor, videosink, nullptr);
+                    videorate, videoQueue, compositor, videosink, nullptr);
 
   // Log every element decodebin auto-plugs internally (parsers, decoders,
   // etc.) so we can confirm at runtime whether it picked a VA-API hardware
@@ -271,8 +273,12 @@ bool cGstDevice::BuildVideoPipeline(void)
     gst_object_unref(sinkpad);
   }), convert);
 
-  if (!gst_element_link(convert, videoQueue)) {
-    esyslog("gstoutput: failed to link videoconvert -> queue");
+  if (!gst_element_link(convert, videorate)) {
+    esyslog("gstoutput: failed to link videoconvert -> videorate");
+    return false;
+  }
+  if (!gst_element_link(videorate, videoQueue)) {
+    esyslog("gstoutput: failed to link videorate -> queue");
     return false;
   }
   if (!gst_element_link(videoQueue, compositor)) {
