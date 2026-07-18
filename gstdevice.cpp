@@ -101,7 +101,6 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
-	putenv((char *)"GST_DEBUG=*:3");  
     int argc = 0;
     gst_init(&argc, nullptr);
   }
@@ -156,7 +155,21 @@ bool cGstDevice::BuildVideoPipeline(void)
   g_object_set(video.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               "do-timestamp", FALSE, // we set PTS ourselves from VDR's STC
+               // Previously FALSE, with PTS set manually from the parsed
+               // broadcast PES timestamp (see PlayVideo()/ExtractPesPts).
+               // That produced a systematic ~500-650ms mismatch between
+               // buffer PTS and the pipeline's actual "now" under bursty
+               // real-world delivery (VDR/satip doesn't always feed data
+               // perfectly paced to real time), which made vaapidecode's
+               // QoS logic judge nearly every frame "too late" and drop
+               // it - a frozen picture, since nothing new ever reached
+               // the compositor. do-timestamp=TRUE has appsrc stamp each
+               // buffer with the actual arrival time instead, which
+               // tracks real delivery pace and is far more robust, at
+               // the cost of no longer using the broadcast PTS directly
+               // for pacing (A/V sync relies on relative arrival timing
+               // between the two appsrcs instead - see the audio side).
+               "do-timestamp", TRUE,
                "block", TRUE,
                "max-bytes", (guint64)(4 * 1024 * 1024),
                nullptr);
@@ -369,7 +382,7 @@ bool cGstDevice::BuildAudioPipeline(void)
   g_object_set(audio.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               "do-timestamp", FALSE,
+               "do-timestamp", TRUE, // see the detailed comment on video.appsrc above
                "block", TRUE,
                "max-bytes", (guint64)(256 * 1024), // throttle VDR feed to sink's real drain rate
                nullptr);
@@ -766,7 +779,9 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
     return Length;
 
   int64_t rawPts90k;
-  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k); // kept for potential future use/diagnostics
+  (void)havePts;
+  (void)rawPts90k;
 
   int payloadOffset = PesPayloadOffset(Data, Length);
   const uchar *payload = Data + payloadOffset;
@@ -776,11 +791,7 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-
-  if (havePts)
-    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
-  else
-    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
+  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // stamped by do-timestamp=TRUE with real arrival time
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(video.appsrc), buf);
   if (ret != GST_FLOW_OK) {
@@ -802,7 +813,9 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
     return Length;
 
   int64_t rawPts90k;
-  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k); // kept for potential future use/diagnostics
+  (void)havePts;
+  (void)rawPts90k;
 
   int payloadOffset = PesPayloadOffset(Data, Length);
   const uchar *payload = Data + payloadOffset;
@@ -812,11 +825,7 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-
-  if (havePts)
-    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
-  else
-    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
+  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // stamped by do-timestamp=TRUE with real arrival time
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(audio.appsrc), buf);
   if (ret != GST_FLOW_OK) {
