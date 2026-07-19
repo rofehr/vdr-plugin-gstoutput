@@ -158,33 +158,19 @@ bool cGstDevice::BuildVideoPipeline(void)
   g_object_set(video.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               // Previously FALSE, with PTS set manually from the parsed
-               // broadcast PES timestamp (see PlayVideo()/ExtractPesPts).
-               // That produced a systematic ~500-650ms mismatch between
-               // buffer PTS and the pipeline's actual "now" under bursty
-               // real-world delivery (VDR/satip doesn't always feed data
-               // perfectly paced to real time), which made vaapidecode's
-               // QoS logic judge nearly every frame "too late" and drop
-               // it - a frozen picture, since nothing new ever reached
-               // the compositor. do-timestamp=TRUE has appsrc stamp each
-               // buffer with the actual arrival time instead, which
-               // tracks real delivery pace and is far more robust, at
-               // the cost of no longer using the broadcast PTS directly
-               // for pacing (A/V sync relies on relative arrival timing
-               // between the two appsrcs instead - see the audio side).
-               "do-timestamp", TRUE,
+               // MUST be FALSE: this content uses B-frames (H.264 High
+               // Profile), which are *decoded* in a different order than
+               // they're *displayed*. The decoder needs the real
+               // broadcast PTS to reconstruct display order correctly.
+               // do-timestamp=TRUE only captures arrival/decode order,
+               // which confused vaapidecode's reordering logic (seen as
+               // "decreasing timestamp" warnings) and fed directly into
+               // the persistent QoS drop cascade. See PlayVideo() for the
+               // real PTS extraction/unwrap, and SyncPipelineClocks() for
+               // how we compensate for the pipeline's hidden buffering
+               // latency without needing do-timestamp as a workaround.
+               "do-timestamp", FALSE,
                "block", TRUE,
-               // Previously 4MB - at typical broadcast bitrates (~3Mbps)
-               // that's 10+ seconds of buffering headroom, letting VDR
-               // burst many seconds of data in almost at once before
-               // "block" ever kicks in. Combined with do-timestamp
-               // capturing push time rather than true playback-paced
-               // time, that produced a persistent multi-second backlog
-               // that vaapidecode kept judging "too late" via QoS,
-               // regardless of actual CPU headroom (observed as
-               // continuous stutter). Much smaller here forces real
-               // backpressure onto VDR's own feeding thread much sooner,
-               // keeping do-timestamp meaningfully close to real time.
                "max-bytes", (guint64)(256 * 1024),
                nullptr);
 
@@ -438,7 +424,7 @@ bool cGstDevice::BuildAudioPipeline(void)
   g_object_set(audio.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               "do-timestamp", TRUE, // see the detailed comment on video.appsrc above
+               "do-timestamp", FALSE, // real broadcast PTS - see the detailed comment on video.appsrc above
                "block", TRUE,
                "max-bytes", (guint64)(256 * 1024), // throttle VDR feed to sink's real drain rate
                nullptr);
@@ -568,18 +554,31 @@ void cGstDevice::SyncPipelineClocks(void)
   if (!sharedClock)
     sharedClock = gst_system_clock_obtain();
 
-  // Only share the clock *instance* between the two pipelines. We
-  // deliberately no longer force an explicit base_time here: doing so
-  // fights GStreamer's own automatic latency-compensated base_time
-  // assignment on the PAUSED->PLAYING transition (gst_bin_do_latency()),
-  // which is the most likely explanation for kmssink's "too late, buffers
-  // dropped" warnings we were seeing - our forced base_time didn't leave
-  // room for the pipeline's actual (VA-API decode + queues + compositor)
-  // latency at all. Sharing just the clock instance still gives both
-  // pipelines a common time reference; each one computes its own
-  // correctly-latency-adjusted base_time against it when it goes PLAYING.
   gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
   gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
+
+  // We went back and forth on this: GStreamer's automatic latency
+  // negotiation (gst_bin_do_latency) *should* handle base_time on its
+  // own, but our elastic "queue" elements don't report their buffered
+  // time in a LATENCY query (that's normal queue behavior - their
+  // capacity is considered elastic, not a fixed pipeline delay), so the
+  // automatically-computed base_time consistently underestimated the
+  // real end-to-end delay (decode + queues + compositor). That showed up
+  // as persistent "Dropping frame due to QoS" - the sink kept judging
+  // on-time frames as late by roughly the amount of hidden buffering.
+  //
+  // Rather than trying to make every element self-report perfectly
+  // accurate latency, we compensate with a fixed safety margin here:
+  // set base_time slightly in the *past*, giving the pipeline artificial
+  // breathing room that comfortably covers our queues' max-size-time
+  // (100ms each) plus typical VA-API decode overhead. Buffers that are
+  // genuinely on-time relative to *this* base_time arrive with margin to
+  // spare instead of being judged late on arrival.
+  static const GstClockTime LATENCY_SAFETY_MARGIN = 400 * GST_MSECOND;
+  GstClockTime now = gst_clock_get_time(sharedClock);
+  GstClockTime shiftedBaseTime = (now > LATENCY_SAFETY_MARGIN) ? (now - LATENCY_SAFETY_MARGIN) : 0;
+  gst_element_set_base_time(video.pipeline, shiftedBaseTime);
+  gst_element_set_base_time(audio.pipeline, shiftedBaseTime);
 }
 
 
@@ -841,9 +840,7 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
     return Length;
 
   int64_t rawPts90k;
-  bool havePts = ExtractPesPts(Data, Length, rawPts90k); // kept for potential future use/diagnostics
-  (void)havePts;
-  (void)rawPts90k;
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
 
   int payloadOffset = PesPayloadOffset(Data, Length);
   const uchar *payload = Data + payloadOffset;
@@ -853,7 +850,10 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // stamped by do-timestamp=TRUE with real arrival time
+  if (havePts)
+    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
+  else
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(video.appsrc), buf);
   if (ret != GST_FLOW_OK) {
@@ -875,9 +875,7 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
     return Length;
 
   int64_t rawPts90k;
-  bool havePts = ExtractPesPts(Data, Length, rawPts90k); // kept for potential future use/diagnostics
-  (void)havePts;
-  (void)rawPts90k;
+  bool havePts = ExtractPesPts(Data, Length, rawPts90k);
 
   int payloadOffset = PesPayloadOffset(Data, Length);
   const uchar *payload = Data + payloadOffset;
@@ -887,7 +885,10 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-  GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // stamped by do-timestamp=TRUE with real arrival time
+  if (havePts)
+    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
+  else
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
 
   GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(audio.appsrc), buf);
   if (ret != GST_FLOW_OK) {
