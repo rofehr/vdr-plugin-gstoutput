@@ -174,7 +174,18 @@ bool cGstDevice::BuildVideoPipeline(void)
                // between the two appsrcs instead - see the audio side).
                "do-timestamp", TRUE,
                "block", TRUE,
-               "max-bytes", (guint64)(4 * 1024 * 1024),
+               // Previously 4MB - at typical broadcast bitrates (~3Mbps)
+               // that's 10+ seconds of buffering headroom, letting VDR
+               // burst many seconds of data in almost at once before
+               // "block" ever kicks in. Combined with do-timestamp
+               // capturing push time rather than true playback-paced
+               // time, that produced a persistent multi-second backlog
+               // that vaapidecode kept judging "too late" via QoS,
+               // regardless of actual CPU headroom (observed as
+               // continuous stutter). Much smaller here forces real
+               // backpressure onto VDR's own feeding thread much sooner,
+               // keeping do-timestamp meaningfully close to real time.
+               "max-bytes", (guint64)(256 * 1024),
                nullptr);
 
   GstElement *parse    = gst_element_factory_make("h264parse", "video-parse");
