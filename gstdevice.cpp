@@ -278,7 +278,8 @@ bool cGstDevice::BuildVideoPipeline(void)
       // that default didn't match the real content rate, e.g. 50fps
       // broadcasts getting silently retimed to 25fps).
       GstStructure *s = gst_caps_get_structure(caps, 0);
-      gint fpsNum = 0, fpsDen = 1;
+      gint fpsNum = 0;
+      gint fpsDen = 1;
       if (gst_structure_get_fraction(s, "framerate", &fpsNum, &fpsDen) && fpsNum > 0) {
         GstCaps *rateCaps = gst_caps_new_simple("video/x-raw",
                                                  "framerate", GST_TYPE_FRACTION, fpsNum, fpsDen,
