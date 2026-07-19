@@ -579,6 +579,12 @@ void cGstDevice::SyncPipelineClocks(void)
   GstClockTime shiftedBaseTime = (now > LATENCY_SAFETY_MARGIN) ? (now - LATENCY_SAFETY_MARGIN) : 0;
   gst_element_set_base_time(video.pipeline, shiftedBaseTime);
   gst_element_set_base_time(audio.pipeline, shiftedBaseTime);
+  // Without this, GStreamer's own "distribute new base_time" logic during
+  // the PAUSED->PLAYING transition can recompute and override what we
+  // just set above, silently making the safety margin a no-op. This tells
+  // it "I'm managing base_time myself, don't touch it."
+  gst_element_set_start_time(video.pipeline, GST_CLOCK_TIME_NONE);
+  gst_element_set_start_time(audio.pipeline, GST_CLOCK_TIME_NONE);
 }
 
 
