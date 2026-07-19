@@ -101,6 +101,10 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
+	
+	// 1. Entspricht GST_DEBUG=*:3
+    gst_debug_set_threshold_from_string("*:3", TRUE);	  
+	 
     int argc = 0;
     gst_init(&argc, nullptr);
   }
