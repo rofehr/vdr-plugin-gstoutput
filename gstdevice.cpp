@@ -101,10 +101,9 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
-	
 	// 1. Entspricht GST_DEBUG=*:3
     gst_debug_set_threshold_from_string("*:3", TRUE);	  
-	 
+
     int argc = 0;
     gst_init(&argc, nullptr);
   }
@@ -233,8 +232,16 @@ bool cGstDevice::BuildVideoPipeline(void)
     // receiver thread via PlayTs()/PlayVideo()) never blocks waiting for
     // kmssink's display timing. Without this, VDR's own DVB receive ring
     // buffer overflows because it can't be drained fast enough.
+    //
+    // Kept deliberately small (was 500ms): a plain "queue" element does
+    // NOT report its buffered time in GStreamer's LATENCY query/pipeline
+    // negotiation - so whatever time a frame actually spends sitting here
+    // is invisible to the sink's "is this frame late" (QoS) calculation.
+    // A large value here caused persistent QoS-driven frame drops with no
+    // real CPU overload behind them, since arriving frames were reliably
+    // judged "late" by exactly the queue's own hidden delay.
     g_object_set(videoQueue,
-                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
                  "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest frames on sustained overrun
@@ -449,8 +456,14 @@ bool cGstDevice::BuildAudioPipeline(void)
     // VDR/decodebin without blocking the appsrc thread, and drops the
     // *oldest* data instead of overflowing ALSA's ring buffer if a burst
     // is sustained rather than momentary.
+    //
+    // Kept deliberately small (was 500ms) - same reasoning as the video
+    // queue: a plain "queue" doesn't report its buffered time in
+    // GStreamer's latency negotiation, so a large value here causes
+    // persistent QoS-style lateness judgments downstream regardless of
+    // actual CPU headroom.
     g_object_set(queue,
-                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
                  "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest on overrun
