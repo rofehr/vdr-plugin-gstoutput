@@ -103,7 +103,6 @@ bool cGstDevice::Init(void)
   if (!gst_is_initialized()) {
 	// 1. Entspricht GST_DEBUG=*:3
     gst_debug_set_threshold_from_string("*:3", TRUE);	  
-
     int argc = 0;
     gst_init(&argc, nullptr);
   }
@@ -214,13 +213,15 @@ bool cGstDevice::BuildVideoPipeline(void)
                  nullptr);
 
   g_object_set(videosink, "sync", TRUE, nullptr);
-  // Re-enabled: the actual root cause of the earlier crash cascade was
-  // compositor's video-aggregator rejecting our un-timestamped OSD
-  // buffers ("Need timestamped buffers!"), not vaapidecode's QoS-driven
-  // frame dropping - see the do-timestamp fix on osdAppsrc above. Leaving
-  // qos disabled here was only masking that, at the cost of the pipeline
-  // no longer being able to gracefully shed frames under real overload
-  // (visible as stutter instead of an occasional dropped frame).
+  // Disabled again: this time not as a workaround for the earlier
+  // OSD-timestamp crash (that's genuinely fixed - see do-timestamp on
+  // osdAppsrc), but because a persistent ~750-800ms gap between frame
+  // timestamps and the sink's "earliest acceptable time" survived every
+  // attempt at fixing pipeline latency negotiation/base_time (see
+  // SyncPipelineClocks()). Rather than keep chasing that, we stop
+  // vaapidecode from reacting to it at all - frames get decoded and
+  // pushed regardless of whether the sink thinks they're "late".
+  g_object_set(videosink, "qos", FALSE, nullptr);
 
   if (videoQueue) {
     // Same rationale as the audio queue: decouples the sink's real-time
@@ -554,37 +555,19 @@ void cGstDevice::SyncPipelineClocks(void)
   if (!sharedClock)
     sharedClock = gst_system_clock_obtain();
 
+  // We tried manually shifting base_time backward by a fixed safety
+  // margin here (with gst_element_set_start_time(GST_CLOCK_TIME_NONE) to
+  // stop GStreamer from re-computing it) to compensate for our queues'
+  // buffering time being invisible to automatic latency negotiation.
+  // Across repeated tests this had *no measurable effect* - the same
+  // ~750-800ms gap between frame timestamps and the sink's "earliest
+  // acceptable time" persisted regardless of the margin used, meaning
+  // GStreamer's own base_time handling was overriding it anyway. Rather
+  // than keep fighting that, we just share the clock instance (still
+  // needed for cross-pipeline timing) and address the QoS drops directly
+  // at the sink instead - see the "qos" property on kmssink.
   gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
   gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
-
-  // We went back and forth on this: GStreamer's automatic latency
-  // negotiation (gst_bin_do_latency) *should* handle base_time on its
-  // own, but our elastic "queue" elements don't report their buffered
-  // time in a LATENCY query (that's normal queue behavior - their
-  // capacity is considered elastic, not a fixed pipeline delay), so the
-  // automatically-computed base_time consistently underestimated the
-  // real end-to-end delay (decode + queues + compositor). That showed up
-  // as persistent "Dropping frame due to QoS" - the sink kept judging
-  // on-time frames as late by roughly the amount of hidden buffering.
-  //
-  // Rather than trying to make every element self-report perfectly
-  // accurate latency, we compensate with a fixed safety margin here:
-  // set base_time slightly in the *past*, giving the pipeline artificial
-  // breathing room that comfortably covers our queues' max-size-time
-  // (100ms each) plus typical VA-API decode overhead. Buffers that are
-  // genuinely on-time relative to *this* base_time arrive with margin to
-  // spare instead of being judged late on arrival.
-  static const GstClockTime LATENCY_SAFETY_MARGIN = 400 * GST_MSECOND;
-  GstClockTime now = gst_clock_get_time(sharedClock);
-  GstClockTime shiftedBaseTime = (now > LATENCY_SAFETY_MARGIN) ? (now - LATENCY_SAFETY_MARGIN) : 0;
-  gst_element_set_base_time(video.pipeline, shiftedBaseTime);
-  gst_element_set_base_time(audio.pipeline, shiftedBaseTime);
-  // Without this, GStreamer's own "distribute new base_time" logic during
-  // the PAUSED->PLAYING transition can recompute and override what we
-  // just set above, silently making the safety margin a no-op. This tells
-  // it "I'm managing base_time myself, don't touch it."
-  gst_element_set_start_time(video.pipeline, GST_CLOCK_TIME_NONE);
-  gst_element_set_start_time(audio.pipeline, GST_CLOCK_TIME_NONE);
 }
 
 
