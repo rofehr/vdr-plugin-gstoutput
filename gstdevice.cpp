@@ -24,31 +24,22 @@ bool StreamIdHasNoPesHeader(uchar StreamId)
 // Extracts the 33-bit, 90kHz PTS from a PES packet as delivered by VDR to
 // cDevice::PlayVideo()/PlayAudio(). Returns false if Data isn't a
 // start-code-prefixed PES packet, or carries no PTS (PTS_DTS_flags == 0).
-//
-// PES header layout (relevant part), ISO/IEC 13818-1 2.4.3.7:
-//   [0..2]  packet_start_code_prefix = 00 00 01
-//   [3]     stream_id
-//   [4..5]  PES_packet_length
-//   [6]     '10' + scrambling + priority + alignment + copyright + original
-//   [7]     PTS_DTS_flags(2) + ESCR_flag + ES_rate_flag + ... (1 byte)
-//   [8]     PES_header_data_length
-//   [9..13] PTS (5 bytes, present iff PTS_DTS_flags != 0)
 bool ExtractPesPts(const uchar *Data, int Length, int64_t &Pts90k)
 {
   if (Length < 14)
     return false;
   if (Data[0] != 0x00 || Data[1] != 0x00 || Data[2] != 0x01)
-    return false; // not PES-framed (e.g. a bare ES fragment) - caller falls back to no-PTS
+    return false;
   if (StreamIdHasNoPesHeader(Data[3]))
     return false;
   if ((Data[6] & 0xC0) != 0x80)
-    return false; // not an MPEG-2 optional PES header
+    return false;
   uchar ptsDtsFlags = (Data[7] >> 6) & 0x03;
   if (ptsDtsFlags == 0)
-    return false; // no PTS in this packet
+    return false;
   const uchar *p = Data + 9;
   if ((p[0] & 0xF0) != 0x20 && (p[0] & 0xF0) != 0x30)
-    return false; // marker nibble mismatch, malformed/unexpected header
+    return false;
 
   int64_t b32_30 = (p[0] >> 1) & 0x07;
   int64_t b29_22 = p[1];
@@ -61,14 +52,9 @@ bool ExtractPesPts(const uchar *Data, int Length, int64_t &Pts90k)
 }
 
 // Returns the byte offset in a PES packet where the actual elementary
-// stream payload begins - i.e. past the PES header itself. We were
-// previously pushing the *entire* PES packet (header included) into
-// appsrc/h264parse, which occasionally corrupts NAL unit boundary
-// detection (observed as "unknown NAL unit type id 0, skip" from the
-// VA-API H.264 decoder, eventually escalating into a fatal streaming
-// error). Falls back to 6 (bare fixed header, no optional fields) or 0
-// (not PES-framed at all - e.g. a raw continuation fragment, pass through
-// unmodified) if this doesn't look like a standard PES optional header.
+// stream payload begins - i.e. past the PES header itself. Pushing the
+// raw PES header into a codec parser corrupts NAL/frame boundary
+// detection (observed as decode errors), so this must always be stripped.
 int PesPayloadOffset(const uchar *Data, int Length)
 {
   if (Length < 9 || Data[0] != 0x00 || Data[1] != 0x00 || Data[2] != 0x01)
@@ -78,11 +64,80 @@ int PesPayloadOffset(const uchar *Data, int Length)
   int headerDataLen = Data[8];
   int offset = 9 + headerDataLen;
   if (offset > Length)
-    return Length; // malformed/truncated - avoid a negative payload length
+    return Length;
   return offset;
 }
 
+// Tries decoder elements in priority order (hardware first, software
+// last) and returns the first one that actually instantiates on this
+// system. Some hardware decoder families (the older "vaapidecode", as
+// opposed to the newer unified "va" plugin's "vah264dec") need an
+// explicit postprocessing element afterwards to get their output into a
+// format videoconvert can handle - PostprocFactory carries that, or is
+// left empty if not needed.
+struct DecoderCandidate {
+  const char *decoderFactory;
+  const char *postprocFactory; // may be nullptr
+};
+
+bool TryCreateDecoder(const DecoderCandidate candidates[], int count,
+                      GstElement **outDecoder, GstElement **outPostproc,
+                      const char **outFactoryName)
+{
+  for (int i = 0; i < count; i++) {
+    GstElement *dec = gst_element_factory_make(candidates[i].decoderFactory, "video-decoder");
+    if (!dec)
+      continue;
+    GstElement *post = nullptr;
+    if (candidates[i].postprocFactory) {
+      post = gst_element_factory_make(candidates[i].postprocFactory, "video-postproc");
+      if (!post) {
+        gst_object_unref(dec);
+        continue; // this candidate needs postproc but it's not available - try the next one
+      }
+    }
+    *outDecoder = dec;
+    *outPostproc = post;
+    *outFactoryName = candidates[i].decoderFactory;
+    return true;
+  }
+  return false;
+}
+
 } // namespace
+
+// ===========================================================================
+// cGstFeederThread
+// ===========================================================================
+
+cGstFeederThread::cGstFeederThread(GAsyncQueue *Queue, GstElement *AppSrc, const char *Name)
+: cThread(Name), queue(Queue), appsrc(AppSrc)
+{
+  Start();
+}
+
+cGstFeederThread::~cGstFeederThread()
+{
+  Cancel(3); // ask Action()'s loop to stop and wait up to 3s for it to actually exit
+}
+
+void cGstFeederThread::Action(void)
+{
+  while (Running()) {
+    // Timeout so we periodically re-check Running() for clean shutdown,
+    // without busy-polling.
+    GstBuffer *buf = static_cast<GstBuffer *>(g_async_queue_timeout_pop(queue, 100000 /* 100ms, in microseconds */));
+    if (!buf)
+      continue;
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf); // takes ownership of buf
+    if (ret != GST_FLOW_OK)
+      esyslog("gstoutput: feeder thread push failed on %s (%d)", GST_OBJECT_NAME(appsrc), ret);
+  }
+}
+
+// ===========================================================================
+// cGstDevice
+// ===========================================================================
 
 cGstDevice::cGstDevice(const char *VideoSink, const char *AudioSink, const char *Connector)
 : videoSinkName(VideoSink), audioSinkName(AudioSink), connectorName(Connector)
@@ -101,8 +156,6 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
-	// 1. Entspricht GST_DEBUG=*:3
-    gst_debug_set_threshold_from_string("*:3", TRUE);	  
     int argc = 0;
     gst_init(&argc, nullptr);
   }
@@ -111,6 +164,11 @@ bool cGstDevice::Init(void)
     esyslog("gstoutput: pipeline construction failed");
     return false;
   }
+
+  videoQueue = g_async_queue_new_full((GDestroyNotify)gst_buffer_unref);
+  audioQueue = g_async_queue_new_full((GDestroyNotify)gst_buffer_unref);
+  videoFeeder = new cGstFeederThread(videoQueue, video.appsrc, "gst-video-feeder");
+  audioFeeder = new cGstFeederThread(audioQueue, audio.appsrc, "gst-audio-feeder");
 
   gst_element_set_state(video.pipeline, GST_STATE_READY);
   gst_element_set_state(audio.pipeline, GST_STATE_READY);
@@ -140,14 +198,17 @@ void cGstDevice::PushInitialOsdFrame(void)
 }
 
 // -----------------------------------------------------------------------
-// Video pipeline:
-//   appsrc(ts/es) -> tsdemux/h264parse -> decodebin -> videoconvert ->
-//   compositor (sink_0 = decoded video, sink_1 = OSD overlay) -> videosink
+// Video pipeline (explicit chain, no decodebin):
 //
-// The compositor gives us OSD-over-video without a separate window
-// manager, and works with kmssink/waylandsink for a DRM/KMS direct
-// output path, matching the fbdev/Mali setup used elsewhere in this
-// environment.
+//   appsrc -> h264parse(config-interval=-1) -> [decoder] -> [postproc?] ->
+//   videoconvert -> queue -> compositor (sink_0) -> videosink
+//
+//   appsrc(OSD, BGRA) -> videoconvert -> capsfilter(BGRA) -> queue ->
+//   compositor (sink_1, zorder=1, on top)
+//
+// [decoder] is chosen at runtime: VA-API first, then V4L2, then software
+// as a last resort - see TryCreateDecoder(). No decodebin/dynamic pads
+// anywhere in this graph, so the whole chain links statically up front.
 // -----------------------------------------------------------------------
 bool cGstDevice::BuildVideoPipeline(void)
 {
@@ -157,49 +218,54 @@ bool cGstDevice::BuildVideoPipeline(void)
   g_object_set(video.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               // MUST be FALSE: this content uses B-frames (H.264 High
-               // Profile), which are *decoded* in a different order than
-               // they're *displayed*. The decoder needs the real
-               // broadcast PTS to reconstruct display order correctly.
-               // do-timestamp=TRUE only captures arrival/decode order,
-               // which confused vaapidecode's reordering logic (seen as
-               // "decreasing timestamp" warnings) and fed directly into
-               // the persistent QoS drop cascade. See PlayVideo() for the
-               // real PTS extraction/unwrap, and SyncPipelineClocks() for
-               // how we compensate for the pipeline's hidden buffering
-               // latency without needing do-timestamp as a workaround.
+               // MUST be FALSE: this content commonly uses B-frames
+               // (H.264 High Profile), decoded in a different order than
+               // displayed. The decoder needs the real broadcast PTS to
+               // reconstruct display order correctly - do-timestamp's
+               // arrival-order stamping cannot provide that.
                "do-timestamp", FALSE,
                "block", TRUE,
                "max-bytes", (guint64)(256 * 1024),
                nullptr);
 
-  GstElement *parse    = gst_element_factory_make("h264parse", "video-parse");
-  GstElement *decode    = gst_element_factory_make("decodebin", "video-decode");
-  GstElement *convert   = gst_element_factory_make("videoconvert", "video-convert");
-  GstElement *videorate     = gst_element_factory_make("videorate", "video-rate");
-  GstElement *rateCapsFilter = gst_element_factory_make("capsfilter", "video-rate-caps");
-  GstElement *videoQueue = gst_element_factory_make("queue", "video-elastic-queue");
-  compositor            = gst_element_factory_make("compositor", "video-mixer");
-  GstElement *videosink = gst_element_factory_make(*videoSinkName, "video-sink");
+  GstElement *parse = gst_element_factory_make("h264parse", "video-parse");
+  if (parse)
+    g_object_set(parse, "config-interval", -1, nullptr); // (re-)send SPS/PPS before every IDR
+
+  static const DecoderCandidate candidates[] = {
+    { "vah264dec",   nullptr },           // new unified VA plugin (GStreamer >= 1.20ish)
+    { "vaapidecode", "vaapipostproc" },    // older gstreamer-vaapi plugin family
+    { "v4l2h264dec", nullptr },            // V4L2 stateful/stateless M2M decoder
+    { "avdec_h264",  nullptr },            // software fallback (ffmpeg-based)
+  };
+  GstElement *decoder = nullptr;
+  GstElement *postproc = nullptr;
+  const char *chosenFactory = nullptr;
+  bool haveDecoder = TryCreateDecoder(candidates, (int)(sizeof(candidates) / sizeof(candidates[0])),
+                                       &decoder, &postproc, &chosenFactory);
+  if (haveDecoder)
+    isyslog("gstoutput: video decoder: %s%s%s", chosenFactory,
+            postproc ? " + " : "", postproc ? GST_OBJECT_NAME(postproc) : "");
+
+  GstElement *convert     = gst_element_factory_make("videoconvert", "video-convert");
+  GstElement *videoQueueEl = gst_element_factory_make("queue", "video-elastic-queue");
+  compositor               = gst_element_factory_make("compositor", "video-mixer");
+  GstElement *videosink   = gst_element_factory_make(*videoSinkName, "video-sink");
 
   struct { const char *name; GstElement *elem; } required[] = {
-    { "appsrc",           video.appsrc },
-    { "h264parse",        parse },
-    { "decodebin",        decode },
-    { "videoconvert",     convert },
-    { "videorate",        videorate },
-    { "capsfilter",       rateCapsFilter },
-    { "queue",            videoQueue },
-    { "compositor",       compositor },
-    { *videoSinkName,     videosink },
+    { "appsrc",       video.appsrc },
+    { "h264parse",    parse },
+    { "decoder",      decoder },
+    { "videoconvert", convert },
+    { "queue",        videoQueueEl },
+    { "compositor",   compositor },
+    { *videoSinkName, videosink },
   };
   bool missing = false;
   for (auto &r : required) {
     if (!r.elem) {
-      esyslog("gstoutput: GStreamer element factory '%s' not found — "
-              "run 'gst-inspect-1.0 %s' on the target to confirm, then check "
-              "which gstreamer1.0-plugins-{base,good,bad} package provides it "
-              "and whether it's in your image/recipe DEPENDS+RDEPENDS", r.name, r.name);
+      esyslog("gstoutput: GStreamer element factory '%s' not found - "
+              "run 'gst-inspect-1.0 %s' on the target to confirm", r.name, r.name);
       missing = true;
     }
   }
@@ -213,131 +279,50 @@ bool cGstDevice::BuildVideoPipeline(void)
                  nullptr);
 
   g_object_set(videosink, "sync", TRUE, nullptr);
-  // Disabled again: this time not as a workaround for the earlier
-  // OSD-timestamp crash (that's genuinely fixed - see do-timestamp on
-  // osdAppsrc), but because a persistent ~750-800ms gap between frame
-  // timestamps and the sink's "earliest acceptable time" survived every
-  // attempt at fixing pipeline latency negotiation/base_time (see
-  // SyncPipelineClocks()). Rather than keep chasing that, we stop
-  // vaapidecode from reacting to it at all - frames get decoded and
-  // pushed regardless of whether the sink thinks they're "late".
+  // Disabled: a persistent gap between frame timestamps and the sink's
+  // "earliest acceptable time" survived every attempt at fixing pipeline
+  // latency negotiation/base_time, without any real CPU overload behind
+  // it. Rather than keep chasing that, we stop vaapidecode from reacting
+  // to QOS events at all, and stop the sink itself from refusing to
+  // render buffers it considers late.
   g_object_set(videosink, "qos", FALSE, nullptr);
+  g_object_set(videosink, "max-lateness", (gint64)-1, nullptr);
 
-  if (videoQueue) {
-    // Same rationale as the audio queue: decouples the sink's real-time
-    // sync-blocking render loop into its own GStreamer streaming thread,
-    // so gst_app_src_push_buffer() (called synchronously from VDR's own
-    // receiver thread via PlayTs()/PlayVideo()) never blocks waiting for
-    // kmssink's display timing. Without this, VDR's own DVB receive ring
-    // buffer overflows because it can't be drained fast enough.
-    //
-    // Kept deliberately small (was 500ms): a plain "queue" element does
-    // NOT report its buffered time in GStreamer's LATENCY query/pipeline
-    // negotiation - so whatever time a frame actually spends sitting here
-    // is invisible to the sink's "is this frame late" (QoS) calculation.
-    // A large value here caused persistent QoS-driven frame drops with no
-    // real CPU overload behind them, since arriving frames were reliably
-    // judged "late" by exactly the queue's own hidden delay.
-    g_object_set(videoQueue,
+  if (videoQueueEl) {
+    // Decoupling at the GStreamer scheduling level is now secondary (the
+    // real decoupling is the GAsyncQueue feeder thread ahead of appsrc -
+    // see cGstFeederThread), so this just needs to smooth minor jitter
+    // between decode and compositor/sink, not protect VDR's own thread.
+    g_object_set(videoQueueEl,
                  "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
-                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest frames on sustained overrun
+                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM
                  nullptr);
   }
 
-  gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decode, convert,
-                    videorate, rateCapsFilter, videoQueue, compositor, videosink, nullptr);
+  gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decoder, convert,
+                    videoQueueEl, compositor, videosink, nullptr);
+  if (postproc)
+    gst_bin_add(GST_BIN(video.pipeline), postproc);
 
-  // Log every element decodebin auto-plugs internally (parsers, decoders,
-  // etc.) so we can confirm at runtime whether it picked a VA-API hardware
-  // decoder (element/factory names starting with "va"/"vaapi") or fell
-  // back to a software decoder (e.g. avdec_h264) - the latter is a common
-  // cause of the host CPU maxing out a core during playback.
-  g_signal_connect(decode, "deep-element-added", G_CALLBACK(+[](GstBin *, GstBin *, GstElement *element, gpointer) {
-    GstElementFactory *factory = gst_element_get_factory(element);
-    const char *factoryName = factory ? GST_OBJECT_NAME(factory) : "(unknown)";
-    isyslog("gstoutput: video decodebin auto-plugged: %s", factoryName);
-  }), nullptr);
-
-  if (!gst_element_link(video.appsrc, parse)) {
-    esyslog("gstoutput: failed to link appsrc -> h264parse");
-    return false;
-  }
-  if (!gst_element_link(parse, decode)) {
-    esyslog("gstoutput: failed to link h264parse -> decodebin");
+  bool linked = gst_element_link(video.appsrc, parse) &&
+                (postproc ? (gst_element_link(parse, decoder) &&
+                             gst_element_link(decoder, postproc) &&
+                             gst_element_link(postproc, convert))
+                          : (gst_element_link(parse, decoder) &&
+                             gst_element_link(decoder, convert))) &&
+                gst_element_link(convert, videoQueueEl) &&
+                gst_element_link(videoQueueEl, compositor) &&
+                gst_element_link(compositor, videosink);
+  if (!linked) {
+    esyslog("gstoutput: failed to link video pipeline chain");
     return false;
   }
 
-  // decodebin exposes its source pad dynamically once it has determined
-  // the stream's caps, so we hook "pad-added" to complete the link.
-  struct PadAddedCtx { GstElement *convert; GstElement *rateFilter; };
-  PadAddedCtx *padCtx = new PadAddedCtx{convert, rateCapsFilter};
-  g_signal_connect(decode, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *pad, gpointer data) {
-    PadAddedCtx *ctx = static_cast<PadAddedCtx *>(data);
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    gchar *capsStr = caps ? gst_caps_to_string(caps) : g_strdup("(no caps yet)");
-    isyslog("gstoutput: video decodebin pad-added, caps=%s", capsStr);
-    g_free(capsStr);
-
-    if (caps) {
-      // Pin videorate's output to the *actual* decoded framerate rather
-      // than letting it negotiate an arbitrary default with whatever's
-      // downstream (observed to cause continuous judder/stutter when
-      // that default didn't match the real content rate, e.g. 50fps
-      // broadcasts getting silently retimed to 25fps).
-      GstStructure *s = gst_caps_get_structure(caps, 0);
-      gint fpsNum = 0;
-      gint fpsDen = 1;
-      if (gst_structure_get_fraction(s, "framerate", &fpsNum, &fpsDen) && fpsNum > 0) {
-        GstCaps *rateCaps = gst_caps_new_simple("video/x-raw",
-                                                 "framerate", GST_TYPE_FRACTION, fpsNum, fpsDen,
-                                                 nullptr);
-        g_object_set(ctx->rateFilter, "caps", rateCaps, nullptr);
-        gst_caps_unref(rateCaps);
-        isyslog("gstoutput: pinning videorate output to %d/%d fps", fpsNum, fpsDen);
-      }
-      gst_caps_unref(caps);
-    }
-
-    GstPad *sinkpad = gst_element_get_static_pad(ctx->convert, "sink");
-    if (!gst_pad_is_linked(sinkpad))
-      gst_pad_link(pad, sinkpad);
-    gst_object_unref(sinkpad);
-  }), padCtx);
-
-  if (!gst_element_link(convert, videorate)) {
-    esyslog("gstoutput: failed to link videoconvert -> videorate");
-    return false;
-  }
-  if (!gst_element_link(videorate, rateCapsFilter)) {
-    esyslog("gstoutput: failed to link videorate -> capsfilter");
-    return false;
-  }
-  if (!gst_element_link(rateCapsFilter, videoQueue)) {
-    esyslog("gstoutput: failed to link capsfilter -> queue");
-    return false;
-  }
-  if (!gst_element_link(videoQueue, compositor)) {
-    esyslog("gstoutput: failed to link queue -> compositor");
-    return false;
-  }
-  if (!gst_element_link(compositor, videosink)) {
-    esyslog("gstoutput: failed to link compositor -> videosink");
-    return false;
-  }
-
-  // Request a second compositor sink pad for the OSD overlay branch;
-  // cGstOsdProvider owns an appsrc that feeds into this pad.
+  // OSD overlay branch: a second appsrc feeding compositor's other input.
   osdAppsrc = gst_element_factory_make("appsrc", "osd-src");
   {
-    // Raw video has no self-describing byte stream (unlike H.264), so
-    // without explicit caps here GStreamer has no way to know the
-    // width/height/format of what we're pushing - the result is exactly
-    // the "garbage / checkerboard" look, not a clean OSD overlay.
-    // NOTE: 1920x1080 matches the hardcoded value in cGstOsd (gstosd.cpp);
-    // both need to move together to a real queried resolution eventually
-    // (see README TODOs).
     GstCaps *osdCaps = gst_caps_new_simple("video/x-raw",
                                             "format",    G_TYPE_STRING, "BGRA",
                                             "width",     G_TYPE_INT,    1920,
@@ -346,77 +331,68 @@ bool cGstDevice::BuildVideoPipeline(void)
                                             nullptr);
     g_object_set(osdAppsrc,
                  // Genuinely needs to be TRUE: with is-live=FALSE,
-                 // compositor's aggregator seems to assume a next buffer
-                 // is always guaranteed to eventually arrive on this pad
-                 // and blocks the *entire* output waiting for it once OSD
-                 // goes quiet - worse than the is-live=TRUE freeze (no
-                 // picture at all instead of a stuck frame). Fixed
-                 // instead via a periodic heartbeat re-push - see
-                 // PushOsdBuffer()/OsdHeartbeat() in gstdevice.cpp.
+                 // compositor's aggregator assumes a next buffer is
+                 // always guaranteed to eventually arrive and blocks the
+                 // *entire* output waiting for it once OSD goes quiet.
+                 // Kept alive instead via a periodic heartbeat re-push -
+                 // see PushOsdBuffer()/OsdHeartbeat().
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
                  // compositor's video-aggregator base class *requires*
                  // every buffer to carry a valid PTS ("Need timestamped
                  // buffers!" otherwise) - do-timestamp=TRUE has appsrc
                  // stamp each buffer with the current pipeline running
-                 // time automatically, which is exactly what a live
-                 // overlay source needs and is far less error-prone than
-                 // us computing it by hand.
+                 // time automatically.
                  "do-timestamp", TRUE,
                  "caps", osdCaps,
                  nullptr);
     gst_caps_unref(osdCaps);
   }
-  GstElement *osdConvert    = gst_element_factory_make("videoconvert", "osd-convert");
-  GstElement *osdCapsFilter = gst_element_factory_make("capsfilter", "osd-capsfilter");
-  GstElement *osdQueue      = gst_element_factory_make("queue", "osd-queue");
+  GstElement *osdConvert     = gst_element_factory_make("videoconvert", "osd-convert");
+  GstElement *osdCapsFilter  = gst_element_factory_make("capsfilter", "osd-capsfilter");
+  GstElement *osdQueueEl     = gst_element_factory_make("queue", "osd-queue");
   {
     // Force the OSD branch to negotiate an alpha-capable format all the
-    // way to the compositor pad. Without this, videoconvert is free to
-    // pick any format compositor's sink pad accepts - including a
-    // non-alpha one - which silently drops our transparency and turns
-    // the (meant-to-be-transparent) OSD buffer into an opaque layer that
-    // blacks out the whole picture at zorder=1.
+    // way to the compositor pad, or videoconvert is free to silently drop
+    // our transparency and blot out the whole picture at zorder=1.
     GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", nullptr);
     g_object_set(osdCapsFilter, "caps", alphaCaps, nullptr);
     gst_caps_unref(alphaCaps);
   }
-  if (osdQueue) {
+  if (osdQueueEl) {
     // Without ANY buffering element in this branch, it reports a
     // max-latency of 0 to compositor's aggregator latency negotiation,
     // which conflicts with the video branch's non-zero min-latency
-    // requirement ("Impossible to configure latency: max 0 < min ...")
-    // and breaks the whole pipeline - not just the OSD overlay. A small
-    // queue is enough; OSD updates are infrequent and don't need the
-    // half-second of headroom the video/audio elastic queues carry.
-    g_object_set(osdQueue,
+    // requirement and breaks the whole pipeline, not just the overlay.
+    g_object_set(osdQueueEl,
                  "max-size-time", (guint64)(200 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
-                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM
+                 "leaky", 2,
                  nullptr);
   }
-  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, osdCapsFilter, osdQueue, nullptr);
-  gst_element_link_many(osdAppsrc, osdConvert, osdCapsFilter, osdQueue, nullptr);
+  gst_bin_add_many(GST_BIN(video.pipeline), osdAppsrc, osdConvert, osdCapsFilter, osdQueueEl, nullptr);
+  gst_element_link_many(osdAppsrc, osdConvert, osdCapsFilter, osdQueueEl, nullptr);
 
-  GstPad *osdSrcPad  = gst_element_get_static_pad(osdQueue, "src");
+  GstPad *osdSrcPad  = gst_element_get_static_pad(osdQueueEl, "src");
   GstPad *mixerSink1 = gst_element_request_pad_simple(compositor, "sink_%u");
   gst_pad_link(osdSrcPad, mixerSink1);
-  // OSD layer always on top, alpha-blended
-  g_object_set(mixerSink1, "zorder", 1, nullptr);
+  g_object_set(mixerSink1, "zorder", 1, nullptr); // OSD layer always on top
   gst_object_unref(osdSrcPad);
 
   // Explicit black background rather than relying on this GStreamer
-  // version's default - rules out compositor's own placeholder pattern
-  // as a source of visual artifacts entirely.
+  // version's default (which is actually "checker", value 0).
   g_object_set(compositor, "background", 1 /* GST_COMPOSITOR_BACKGROUND_BLACK */, nullptr);
 
   video.bus = gst_pipeline_get_bus(GST_PIPELINE(video.pipeline));
-
-
   return true;
 }
 
+// -----------------------------------------------------------------------
+// Audio pipeline: kept on decodebin (unlike video, the codec varies -
+// AAC/AC3/MPEG audio - and decodebin's auto-plugging handles that
+// variability without us hand-picking a parser per codec).
+// -----------------------------------------------------------------------
 bool cGstDevice::BuildAudioPipeline(void)
 {
   audio.pipeline = gst_pipeline_new("gst-audio-pipeline");
@@ -425,9 +401,9 @@ bool cGstDevice::BuildAudioPipeline(void)
   g_object_set(audio.appsrc,
                "is-live", TRUE,
                "format", GST_FORMAT_TIME,
-               "do-timestamp", FALSE, // real broadcast PTS - see the detailed comment on video.appsrc above
+               "do-timestamp", FALSE, // real broadcast PTS - see video.appsrc above
                "block", TRUE,
-               "max-bytes", (guint64)(256 * 1024), // throttle VDR feed to sink's real drain rate
+               "max-bytes", (guint64)(256 * 1024),
                nullptr);
 
   GstElement *parse    = gst_element_factory_make("aacparse", "audio-parse"); // swap for ac3parse/mpegaudioparse as needed
@@ -438,49 +414,33 @@ bool cGstDevice::BuildAudioPipeline(void)
   GstElement *queue    = gst_element_factory_make("queue", "audio-elastic-queue");
 
   if (sink && !strcmp(*audioSinkName, "alsasink")) {
-    // Previous 200000/20000 was a no-op for buffer-time (that's alsasink's
-    // own default!). Bump both meaningfully to give real headroom against
-    // bursty delivery (channel switches, recording playback catching up)
-    // instead of the driver's stock real-time-only sizing. Values in
-    // microseconds.
     g_object_set(sink,
                  "buffer-time", (gint64)1000000, // 1s
                  "latency-time", (gint64)40000,  // 40ms
                  nullptr);
   }
-
   if (queue) {
-    // Elastic, time-bounded buffer ahead of the sink: absorbs bursts from
-    // VDR/decodebin without blocking the appsrc thread, and drops the
-    // *oldest* data instead of overflowing ALSA's ring buffer if a burst
-    // is sustained rather than momentary.
-    //
-    // Kept deliberately small (was 500ms) - same reasoning as the video
-    // queue: a plain "queue" doesn't report its buffered time in
-    // GStreamer's latency negotiation, so a large value here causes
-    // persistent QoS-style lateness judgments downstream regardless of
-    // actual CPU headroom.
     g_object_set(queue,
                  "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
-                 "leaky", 2, // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest on overrun
+                 "leaky", 2,
                  nullptr);
   }
 
   struct { const char *name; GstElement *elem; } required[] = {
-    { "appsrc",         audio.appsrc },
-    { "aacparse",       parse },
-    { "decodebin",      decode },
-    { "audioconvert",   convert },
-    { "audioresample",  resample },
-    { "queue",          queue },
-    { *audioSinkName,   sink },
+    { "appsrc",        audio.appsrc },
+    { "aacparse",      parse },
+    { "decodebin",     decode },
+    { "audioconvert",  convert },
+    { "audioresample", resample },
+    { "queue",         queue },
+    { *audioSinkName,  sink },
   };
   bool missing = false;
   for (auto &r : required) {
     if (!r.elem) {
-      esyslog("gstoutput: GStreamer element factory '%s' not found — "
+      esyslog("gstoutput: GStreamer element factory '%s' not found - "
               "run 'gst-inspect-1.0 %s' on the target to confirm", r.name, r.name);
       missing = true;
     }
@@ -495,11 +455,6 @@ bool cGstDevice::BuildAudioPipeline(void)
 
   g_signal_connect(decode, "pad-added", G_CALLBACK(+[](GstElement *, GstPad *pad, gpointer data) {
     GstElement *convert = GST_ELEMENT(data);
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    gchar *capsStr = caps ? gst_caps_to_string(caps) : g_strdup("(no caps yet)");
-    isyslog("gstoutput: audio decodebin pad-added, caps=%s", capsStr);
-    g_free(capsStr);
-    if (caps) gst_caps_unref(caps);
     GstPad *sinkpad = gst_element_get_static_pad(convert, "sink");
     if (!gst_pad_is_linked(sinkpad))
       gst_pad_link(pad, sinkpad);
@@ -510,66 +465,8 @@ bool cGstDevice::BuildAudioPipeline(void)
   audio.sink = sink;
 
   audio.bus = gst_pipeline_get_bus(GST_PIPELINE(audio.pipeline));
-
   return true;
 }
-
-// Turns a raw 33-bit PES PTS into a monotonically increasing 90kHz value
-// relative to a shared baseline (the first PTS observed on *either* the
-// video or audio stream). Handles the ~26.5h wraparound of the 33-bit
-// counter. Both streams must go through the same ptsBaseline90k so that
-// their resulting running times line up for A/V sync.
-GstClockTime cGstDevice::UnwrapAndOffsetPts(cPtsUnwrap &State, int64_t RawPts33)
-{
-  cMutexLock lock(&ptsMutex);
-
-  if (State.last < 0) {
-    State.extended = RawPts33;
-  } else {
-    int64_t diff = RawPts33 - State.last;
-    if (diff < -PTS_HALF)
-      diff += (PTS_MASK + 1); // forward wrap
-    else if (diff > PTS_HALF)
-      diff -= (PTS_MASK + 1); // backward discontinuity (e.g. channel switch)
-    State.extended += diff;
-  }
-  State.last = RawPts33;
-
-  if (ptsBaseline90k < 0)
-    ptsBaseline90k = State.extended;
-
-  int64_t rel90k = State.extended - ptsBaseline90k;
-  if (rel90k < 0)
-    rel90k = 0; // the other stream's PTS arrived first and set an earlier baseline
-
-  return gst_util_uint64_scale(static_cast<guint64>(rel90k), GST_SECOND, 90000);
-}
-
-// Gives both pipelines the same GstClock instance and the same base_time,
-// which is required for two independent pipelines to agree on "running
-// time" and therefore stay in sync. Without this, each pipeline picks its
-// own base_time on the PAUSED->PLAYING transition and audio/video will
-// drift by whatever startup jitter existed between the two transitions.
-void cGstDevice::SyncPipelineClocks(void)
-{
-  if (!sharedClock)
-    sharedClock = gst_system_clock_obtain();
-
-  // We tried manually shifting base_time backward by a fixed safety
-  // margin here (with gst_element_set_start_time(GST_CLOCK_TIME_NONE) to
-  // stop GStreamer from re-computing it) to compensate for our queues'
-  // buffering time being invisible to automatic latency negotiation.
-  // Across repeated tests this had *no measurable effect* - the same
-  // ~750-800ms gap between frame timestamps and the sink's "earliest
-  // acceptable time" persisted regardless of the margin used, meaning
-  // GStreamer's own base_time handling was overriding it anyway. Rather
-  // than keep fighting that, we just share the clock instance (still
-  // needed for cross-pipeline timing) and address the QoS drops directly
-  // at the sink instead - see the "qos" property on kmssink.
-  gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
-  gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
-}
-
 
 gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
 {
@@ -596,8 +493,6 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
       break;
     }
     case GST_MESSAGE_STATE_CHANGED: {
-      // Only log state changes of the pipelines themselves, not every
-      // internal element, to keep this readable.
       if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->video.pipeline) ||
           GST_MESSAGE_SRC(msg) == GST_OBJECT(self->audio.pipeline)) {
         GstState oldState, newState, pending;
@@ -619,11 +514,6 @@ gboolean cGstDevice::BusCallback(GstBus *, GstMessage *msg, gpointer data)
   return TRUE;
 }
 
-// Called from cPlugin::MainThreadHook(). See the comment in gstdevice.h -
-// gst_bus_add_watch() needs a running GLib main loop to ever invoke its
-// callback, which VDR doesn't provide, so we drain both buses manually
-// instead. gst_bus_pop() is non-blocking (returns nullptr immediately if
-// there's nothing pending), so this is safe to call frequently.
 void cGstDevice::PollBus(void)
 {
   if (video.bus) {
@@ -644,8 +534,6 @@ void cGstDevice::PollBus(void)
   OsdHeartbeat();
 }
 
-// Called by cGstOsd (gstosd.cpp) instead of pushing to osdAppsrc directly,
-// so we can keep a cached copy around for the heartbeat below.
 void cGstDevice::PushOsdBuffer(GstBuffer *Buffer)
 {
   if (!osdAppsrc) {
@@ -664,12 +552,6 @@ void cGstDevice::PushOsdBuffer(GstBuffer *Buffer)
     esyslog("gstoutput: OSD appsrc push failed (%d)", ret);
 }
 
-// compositor's live OSD pad needs to see buffers often enough that its
-// aggregator never considers the pad stalled - see the is-live comment on
-// osdAppsrc in BuildVideoPipeline(). VDR calls cPlugin::MainThreadHook()
-// (which calls PollBus(), which calls this) regularly regardless of
-// whether the OSD is actually changing, so plain live TV with no menu
-// open still gets a steady trickle of re-sent (unchanged) OSD frames.
 void cGstDevice::OsdHeartbeat(void)
 {
   if (!osdAppsrc)
@@ -691,6 +573,23 @@ void cGstDevice::Shutdown(void)
   cMutexLock lock(&mutex);
   if (!initialized)
     return;
+
+  if (videoFeeder) {
+    delete videoFeeder; // stops the thread (see ~cGstFeederThread)
+    videoFeeder = nullptr;
+  }
+  if (audioFeeder) {
+    delete audioFeeder;
+    audioFeeder = nullptr;
+  }
+  if (videoQueue) {
+    g_async_queue_unref(videoQueue);
+    videoQueue = nullptr;
+  }
+  if (audioQueue) {
+    g_async_queue_unref(audioQueue);
+    audioQueue = nullptr;
+  }
 
   if (video.pipeline) {
     gst_element_set_state(video.pipeline, GST_STATE_NULL);
@@ -721,6 +620,31 @@ void cGstDevice::Shutdown(void)
   }
 }
 
+void cGstDevice::SyncPipelineClocks(void)
+{
+  if (!sharedClock)
+    sharedClock = gst_system_clock_obtain();
+
+  // Just share the clock instance between both pipelines - manually
+  // forcing base_time here (tried at length) had no measurable effect on
+  // the sink's lateness judgments, so we don't fight that anymore; see
+  // "qos"/"max-lateness" on kmssink instead.
+  gst_pipeline_use_clock(GST_PIPELINE(video.pipeline), sharedClock);
+  gst_pipeline_use_clock(GST_PIPELINE(audio.pipeline), sharedClock);
+}
+
+void cGstDevice::SuspendDisplay(void)
+{
+  if (video.pipeline)
+    gst_element_set_state(video.pipeline, GST_STATE_NULL);
+}
+
+void cGstDevice::ResumeDisplay(void)
+{
+  if (video.pipeline)
+    gst_element_set_state(video.pipeline, GST_STATE_READY);
+}
+
 bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
 {
   cMutexLock lock(&mutex);
@@ -747,9 +671,6 @@ bool cGstDevice::SetPlayMode(ePlayMode PlayMode)
 
 void cGstDevice::TrickSpeed(int Speed, bool Forward)
 {
-  // Seek-based trick speed: send a rate-only seek event downstream.
-  // Real deployments generally combine this with I-frame-only delivery
-  // from VDR (HasIBPTrickSpeed) to keep decodebin from starving.
   double rate = Forward ? (double)Speed : -(double)Speed;
   if (rate == 0) rate = 1.0;
   GstEvent *seek = gst_event_new_seek(rate, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH,
@@ -762,22 +683,26 @@ void cGstDevice::Clear(void)
 {
   cMutexLock lock(&mutex);
 
-  // NOTE: we deliberately do NOT send flush-start/flush-stop events
-  // directly to the running appsrc elements here anymore. Doing so
-  // triggered "Internal data stream error" from gst_base_src_loop() /
-  // gst_queue_handle_sink_event() (observed inside vaapidecodebin's
-  // internal queue) - appsrc manages its own flush state internally, and
-  // injecting raw flush events into a live streaming thread this way is
-  // not the supported way to reset it. Our own PTS baseline / TS-to-PES /
-  // PAT-PMT resets below are enough for a clean channel switch; stale
-  // buffered data downstream simply gets played out or overwritten by the
-  // new stream's own discontinuities.
+  // Drop anything still queued for the feeder threads - stale data from
+  // before a channel switch shouldn't play out afterwards.
+  if (videoQueue) {
+    GstBuffer *buf;
+    while ((buf = static_cast<GstBuffer *>(g_async_queue_try_pop(videoQueue))) != nullptr)
+      gst_buffer_unref(buf);
+  }
+  if (audioQueue) {
+    GstBuffer *buf;
+    while ((buf = static_cast<GstBuffer *>(g_async_queue_try_pop(audioQueue))) != nullptr)
+      gst_buffer_unref(buf);
+  }
 
   {
     cMutexLock ptsLock(&ptsMutex);
     ptsBaseline90k = -1;
     videoPtsState = cPtsUnwrap();
     audioPtsState = cPtsUnwrap();
+    lastVideoPts = GST_CLOCK_TIME_NONE;
+    lastAudioPts = GST_CLOCK_TIME_NONE;
   }
 
   tsToPesVideo.Reset();
@@ -810,9 +735,27 @@ void cGstDevice::Mute(void)
 
 void cGstDevice::StillPicture(const uchar *Data, int Length)
 {
-  // Push a single I-frame through the video appsrc and hold on PAUSED.
   PlayVideo(Data, Length);
   gst_element_set_state(video.pipeline, GST_STATE_PAUSED);
+}
+
+// Bounds the async queue manually (GAsyncQueue itself has no size limit):
+// if GStreamer's side has fallen behind, drop the *oldest* queued buffer
+// to make room, same "leaky downstream" behavior our GStreamer-side
+// queues use, but applied before the data ever reaches GStreamer at all.
+void cGstDevice::EnqueueBuffer(GAsyncQueue *Queue, GstBuffer *Buffer)
+{
+  if (!Queue) {
+    gst_buffer_unref(Buffer);
+    return;
+  }
+  while ((guint)g_async_queue_length(Queue) >= MAX_QUEUED_BUFFERS) {
+    GstBuffer *old = static_cast<GstBuffer *>(g_async_queue_try_pop(Queue));
+    if (!old)
+      break;
+    gst_buffer_unref(old);
+  }
+  g_async_queue_push(Queue, Buffer);
 }
 
 int cGstDevice::PlayVideo(const uchar *Data, int Length)
@@ -839,16 +782,22 @@ int cGstDevice::PlayVideo(const uchar *Data, int Length)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-  if (havePts)
-    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
-  else
-    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
 
-  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(video.appsrc), buf);
-  if (ret != GST_FLOW_OK) {
-    esyslog("gstoutput: video appsrc push failed (%d)", ret);
-    return 0;
+  if (havePts) {
+    GstClockTime pts = UnwrapAndOffsetPts(videoPtsState, rawPts90k);
+    GST_BUFFER_PTS(buf) = pts;
+    // Duration-from-PTS-delta: robust, self-adjusting, and doesn't need
+    // to know the nominal framerate up front (we removed videorate,
+    // which used to need that).
+    if (GST_CLOCK_TIME_IS_VALID(lastVideoPts) && pts > lastVideoPts)
+      GST_BUFFER_DURATION(buf) = pts - lastVideoPts;
+    lastVideoPts = pts;
   }
+  else {
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE; // e.g. continuation packet without its own PES header
+  }
+
+  EnqueueBuffer(videoQueue, buf);
   return Length;
 }
 
@@ -874,27 +823,31 @@ int cGstDevice::PlayAudio(const uchar *Data, int Length, uchar Id)
 
   GstBuffer *buf = gst_buffer_new_allocate(nullptr, payloadLength, nullptr);
   gst_buffer_fill(buf, 0, payload, payloadLength);
-  if (havePts)
-    GST_BUFFER_PTS(buf) = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
-  else
-    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
 
-  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(audio.appsrc), buf);
-  if (ret != GST_FLOW_OK) {
-    esyslog("gstoutput: audio appsrc push failed (%d)", ret);
-    return 0;
+  if (havePts) {
+    GstClockTime pts = UnwrapAndOffsetPts(audioPtsState, rawPts90k);
+    GST_BUFFER_PTS(buf) = pts;
+    if (GST_CLOCK_TIME_IS_VALID(lastAudioPts) && pts > lastAudioPts)
+      GST_BUFFER_DURATION(buf) = pts - lastAudioPts;
+    lastAudioPts = pts;
   }
+  else {
+    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
+  }
+
+  EnqueueBuffer(audioQueue, buf);
   return Length;
 }
 
 // VDR's live TV and TS-based recording playback deliver raw 188-byte TS
 // packets here (not ready-made PES packets), via cDvbPlayer/cTransfer ->
-// cDevice::PlayTs(). We track PAT/PMT ourselves (via the protected
-// PatPmtParser() accessor) to learn the current video/audio PIDs, and
-// reassemble each stream's PES packets with cTsToPes - mirroring the
-// exact pattern VDR itself uses internally in cDevice::StillPicture():
-// on TsPayloadStart(), drain whatever PES data has accumulated so far,
-// Reset(), *then* start accumulating the new packet.
+// cDevice::PlayTs(). We track PAT/PMT ourselves (ownPatPmtParser, since
+// cDevice::patPmtParser is private in this VDR version) to learn the
+// current video/audio PIDs, and reassemble each stream's PES packets
+// with cTsToPes - mirroring the exact pattern VDR itself uses internally
+// in cDevice::StillPicture(): on TsPayloadStart(), drain whatever PES
+// data has accumulated so far, Reset(), *then* start accumulating the
+// new packet.
 int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
 {
   if (!Data || Length <= 0)
@@ -950,6 +903,32 @@ int cGstDevice::PlayTs(const uchar *Data, int Length, bool VideoOnly)
   return played;
 }
 
+GstClockTime cGstDevice::UnwrapAndOffsetPts(cPtsUnwrap &State, int64_t RawPts33)
+{
+  cMutexLock lock(&ptsMutex);
+
+  if (State.last < 0) {
+    State.extended = RawPts33;
+  } else {
+    int64_t diff = RawPts33 - State.last;
+    if (diff < -PTS_HALF)
+      diff += (PTS_MASK + 1);
+    else if (diff > PTS_HALF)
+      diff -= (PTS_MASK + 1);
+    State.extended += diff;
+  }
+  State.last = RawPts33;
+
+  if (ptsBaseline90k < 0)
+    ptsBaseline90k = State.extended;
+
+  int64_t rel90k = State.extended - ptsBaseline90k;
+  if (rel90k < 0)
+    rel90k = 0;
+
+  return gst_util_uint64_scale(static_cast<guint64>(rel90k), GST_SECOND, 90000);
+}
+
 int64_t cGstDevice::GetSTC(void)
 {
   if (!video.pipeline)
@@ -962,9 +941,7 @@ int64_t cGstDevice::GetSTC(void)
 
   cMutexLock lock(&ptsMutex);
   if (ptsBaseline90k < 0)
-    return pos90k; // no PES PTS observed yet, best effort
+    return pos90k;
 
-  // Re-express in the original broadcast PTS domain (mod 2^33), since
-  // that's what callers comparing against raw stream PTS values expect.
   return (pos90k + ptsBaseline90k) & PTS_MASK;
 }

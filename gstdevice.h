@@ -7,17 +7,14 @@
 #include <vdr/tools.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <glib.h>
 
 // One appsrc-fed sub-pipeline per elementary stream type.
 struct cGstStream {
   GstElement *pipeline   = nullptr;
   GstElement *appsrc     = nullptr;
-  GstElement *parser     = nullptr;
-  GstElement *decoder    = nullptr; // decodebin, auto-plugged
   GstElement *sink       = nullptr;
   GstBus     *bus        = nullptr;
-  guint       watchId    = 0;
-  bool        eos        = false;
 };
 
 // Tracks 33-bit (90kHz) PES PTS unwrap state for one elementary stream, so
@@ -26,6 +23,23 @@ struct cGstStream {
 struct cPtsUnwrap {
   int64_t last     = -1; // last raw 33-bit PTS seen
   int64_t extended = -1; // unwrapped, ever-increasing 90kHz counter
+};
+
+// Pulls queued GstBuffers off a GAsyncQueue and pushes them into an appsrc,
+// entirely in its own thread. This is what actually decouples VDR's
+// PlayTs()/PlayVideo()/PlayAudio() calling thread from GStreamer: those
+// functions now just build a buffer and enqueue it (near-instant, never
+// blocks), instead of calling gst_app_src_push_buffer() directly and
+// potentially blocking on whatever GStreamer's internal scheduling/sink
+// sync is doing at that moment.
+class cGstFeederThread : public cThread {
+private:
+  GAsyncQueue *queue;
+  GstElement  *appsrc;
+public:
+  cGstFeederThread(GAsyncQueue *Queue, GstElement *AppSrc, const char *Name);
+  virtual ~cGstFeederThread();
+  virtual void Action(void);
 };
 
 class cGstDevice : public cDevice {
@@ -55,19 +69,30 @@ private:
   cTimeMs    osdHeartbeatTimer;
   static const int OSD_HEARTBEAT_MS = 200;
 
+  // Decoupling: PlayVideo()/PlayAudio() enqueue here; cGstFeederThread
+  // instances drain them into the respective appsrc on their own thread.
+  // Bounded manually (GAsyncQueue has no built-in size limit) so a stalled
+  // GStreamer side can't grow these without bound - see EnqueueBuffer().
+  GAsyncQueue *videoQueue = nullptr;
+  GAsyncQueue *audioQueue = nullptr;
+  cGstFeederThread *videoFeeder = nullptr;
+  cGstFeederThread *audioFeeder = nullptr;
+  static const guint MAX_QUEUED_BUFFERS = 300; // ~6s at 50fps video, generous for audio too
+  void EnqueueBuffer(GAsyncQueue *Queue, GstBuffer *Buffer);
+
   cMutex mutex;
   bool playing = false;
   bool initialized = false;
 
-  double currentPts = 0.0;
-
-  // --- PTS handling (see PlayVideo/PlayAudio) ---
+  // --- PTS/duration handling (see PlayVideo/PlayAudio) ---
   GstClock *sharedClock  = nullptr; // one clock instance for both pipelines, so
                                      // their running-time bases actually agree
   cMutex    ptsMutex;
   int64_t   ptsBaseline90k = -1;    // first PTS seen (video or audio) -> running time 0
   cPtsUnwrap videoPtsState;
   cPtsUnwrap audioPtsState;
+  GstClockTime lastVideoPts = GST_CLOCK_TIME_NONE; // for duration-from-PTS-delta
+  GstClockTime lastAudioPts = GST_CLOCK_TIME_NONE;
 
   GstClockTime UnwrapAndOffsetPts(cPtsUnwrap &State, int64_t RawPts33);
   void         SyncPipelineClocks(void);
