@@ -156,6 +156,8 @@ bool cGstDevice::Init(void)
     return true;
 
   if (!gst_is_initialized()) {
+    gst_debug_set_default_threshold(GST_LEVEL_INFO);
+  
     int argc = 0;
     gst_init(&argc, nullptr);
   }
