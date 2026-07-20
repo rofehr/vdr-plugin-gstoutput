@@ -357,7 +357,11 @@ bool cGstDevice::BuildVideoPipeline(void)
     // Force the OSD branch to negotiate an alpha-capable format all the
     // way to the compositor pad, or videoconvert is free to silently drop
     // our transparency and blot out the whole picture at zorder=1.
-    GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", nullptr);
+    GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", 
+											"format",    G_TYPE_STRING, "BGRA", 
+											"width",     G_TYPE_INT,    1920,
+                                            "height",    G_TYPE_INT,    1080,
+											nullptr);
     g_object_set(osdCapsFilter, "caps", alphaCaps, nullptr);
     gst_caps_unref(alphaCaps);
   }
