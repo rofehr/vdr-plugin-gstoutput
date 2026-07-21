@@ -235,10 +235,11 @@ bool cGstDevice::BuildVideoPipeline(void)
     g_object_set(parse, "config-interval", -1, nullptr); // (re-)send SPS/PPS before every IDR
 
   static const DecoderCandidate candidates[] = {
-    { "vah264dec",   nullptr },           // new unified VA plugin (GStreamer >= 1.20ish)
-    { "vaapidecode", "vaapipostproc" },    // older gstreamer-vaapi plugin family
-    { "v4l2h264dec", nullptr },            // V4L2 stateful/stateless M2M decoder
-    { "avdec_h264",  nullptr },            // software fallback (ffmpeg-based)
+    { "vah264dec",      nullptr },  // new unified VA plugin (GStreamer >= 1.20ish), if present
+    { "vaapidecodebin", nullptr },  // gstreamer-vaapi's self-contained decode+postproc bin -
+                                     // some builds don't expose a standalone "vaapidecode" at all
+    { "v4l2h264dec",    nullptr },  // V4L2 stateful/stateless M2M decoder
+    { "avdec_h264",     nullptr },  // software fallback (ffmpeg-based)
   };
   GstElement *decoder = nullptr;
   GstElement *postproc = nullptr;
@@ -252,7 +253,22 @@ bool cGstDevice::BuildVideoPipeline(void)
   GstElement *convert     = gst_element_factory_make("videoconvert", "video-convert");
   GstElement *videoQueueEl = gst_element_factory_make("queue", "video-elastic-queue");
   compositor               = gst_element_factory_make("compositor", "video-mixer");
+  GstElement *outputCapsFilter = gst_element_factory_make("capsfilter", "output-caps");
   GstElement *videosink   = gst_element_factory_make(*videoSinkName, "video-sink");
+
+  if (outputCapsFilter) {
+    // Force a single, fixed output size for the whole composited frame
+    // (video + OSD combined), rather than letting compositor/kmssink
+    // negotiate an arbitrary size - a mismatch between the negotiated
+    // size and what the DRM plane actually expects showed up as
+    // "drmModeSetPlane failed: Invalid argument" from kmssink.
+    GstCaps *outCaps = gst_caps_new_simple("video/x-raw",
+                                            "width",  G_TYPE_INT, 1920,
+                                            "height", G_TYPE_INT, 1080,
+                                            nullptr);
+    g_object_set(outputCapsFilter, "caps", outCaps, nullptr);
+    gst_caps_unref(outCaps);
+  }
 
   struct { const char *name; GstElement *elem; } required[] = {
     { "appsrc",       video.appsrc },
@@ -261,6 +277,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     { "videoconvert", convert },
     { "queue",        videoQueueEl },
     { "compositor",   compositor },
+    { "capsfilter",   outputCapsFilter },
     { *videoSinkName, videosink },
   };
   bool missing = false;
@@ -304,7 +321,7 @@ bool cGstDevice::BuildVideoPipeline(void)
   }
 
   gst_bin_add_many(GST_BIN(video.pipeline), video.appsrc, parse, decoder, convert,
-                    videoQueueEl, compositor, videosink, nullptr);
+                    videoQueueEl, compositor, outputCapsFilter, videosink, nullptr);
   if (postproc)
     gst_bin_add(GST_BIN(video.pipeline), postproc);
 
@@ -315,12 +332,28 @@ bool cGstDevice::BuildVideoPipeline(void)
                           : (gst_element_link(parse, decoder) &&
                              gst_element_link(decoder, convert))) &&
                 gst_element_link(convert, videoQueueEl) &&
-                gst_element_link(videoQueueEl, compositor) &&
-                gst_element_link(compositor, videosink);
+                gst_element_link(compositor, outputCapsFilter) &&
+                gst_element_link(outputCapsFilter, videosink);
   if (!linked) {
     esyslog("gstoutput: failed to link video pipeline chain");
     return false;
   }
+
+  // Request the video input pad explicitly (rather than via the generic
+  // gst_element_link convenience function) so we can size it to fill the
+  // fixed 1920x1080 canvas - otherwise the compositor would place the
+  // decoded content at its native 1280x720 in the top-left corner only.
+  GstPad *videoQueueSrcPad = gst_element_get_static_pad(videoQueueEl, "src");
+  GstPad *mixerSink0 = gst_element_request_pad_simple(compositor, "sink_%u");
+  gst_pad_link(videoQueueSrcPad, mixerSink0);
+  g_object_set(mixerSink0,
+               "width",  1920,
+               "height", 1080,
+               "xpos",   0,
+               "ypos",   0,
+               "zorder", 0,
+               nullptr);
+  gst_object_unref(videoQueueSrcPad);
 
   // OSD overlay branch: a second appsrc feeding compositor's other input.
   osdAppsrc = gst_element_factory_make("appsrc", "osd-src");
@@ -357,11 +390,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     // Force the OSD branch to negotiate an alpha-capable format all the
     // way to the compositor pad, or videoconvert is free to silently drop
     // our transparency and blot out the whole picture at zorder=1.
-    GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", 
-											"format",    G_TYPE_STRING, "BGRA", 
-											"width",     G_TYPE_INT,    1920,
-                                            "height",    G_TYPE_INT,    1080,
-											nullptr);
+    GstCaps *alphaCaps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", nullptr);
     g_object_set(osdCapsFilter, "caps", alphaCaps, nullptr);
     gst_caps_unref(alphaCaps);
   }
@@ -383,7 +412,13 @@ bool cGstDevice::BuildVideoPipeline(void)
   GstPad *osdSrcPad  = gst_element_get_static_pad(osdQueueEl, "src");
   GstPad *mixerSink1 = gst_element_request_pad_simple(compositor, "sink_%u");
   gst_pad_link(osdSrcPad, mixerSink1);
-  g_object_set(mixerSink1, "zorder", 1, nullptr); // OSD layer always on top
+  g_object_set(mixerSink1,
+               "width",  1920,
+               "height", 1080,
+               "xpos",   0,
+               "ypos",   0,
+               "zorder", 1, // OSD layer always on top
+               nullptr);
   gst_object_unref(osdSrcPad);
 
   // Explicit black background rather than relying on this GStreamer
