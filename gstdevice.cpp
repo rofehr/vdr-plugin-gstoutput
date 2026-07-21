@@ -313,7 +313,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     // see cGstFeederThread), so this just needs to smooth minor jitter
     // between decode and compositor/sink, not protect VDR's own thread.
     g_object_set(videoQueueEl,
-                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
                  "leaky", 0, // GST_QUEUE_LEAK_DOWNSTREAM
@@ -400,7 +400,7 @@ bool cGstDevice::BuildVideoPipeline(void)
     // which conflicts with the video branch's non-zero min-latency
     // requirement and breaks the whole pipeline, not just the overlay.
     g_object_set(osdQueueEl,
-                 "max-size-time", (guint64)(500 * GST_MSECOND),
+                 "max-size-time", (guint64)(100 * GST_MSECOND),
                  "max-size-bytes", (guint)0,
                  "max-size-buffers", (guint)0,
                  "leaky", 0,
