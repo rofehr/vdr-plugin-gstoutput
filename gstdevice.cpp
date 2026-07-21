@@ -423,7 +423,10 @@ bool cGstDevice::BuildVideoPipeline(void)
 
   // Explicit black background rather than relying on this GStreamer
   // version's default (which is actually "checker", value 0).
-  g_object_set(compositor, "background", 1 /* GST_COMPOSITOR_BACKGROUND_BLACK */, nullptr);
+  g_object_set(compositor, 
+			   "background", 1 /* GST_COMPOSITOR_BACKGROUND_BLACK */, 
+			   "latency", 250 * GST_MSECOND,			   
+			   nullptr);
 
   video.bus = gst_pipeline_get_bus(GST_PIPELINE(video.pipeline));
   return true;
